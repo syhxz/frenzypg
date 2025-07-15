@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -57,7 +58,38 @@ func main() {
 	maxConnIdleTime := parser.Int("", "max-conn-idle-time", &argparse.Options{
 		Required: false,
 		Help:     "Maximum connection idle time in seconds (0 means never expire)",
+		Default:  300,  // Changed default to 5 minutes
+	})
+
+	// Performance optimization options
+	workerThreads := parser.Int("", "worker-threads", &argparse.Options{
+		Required: false,
+		Help:     "Number of worker threads for query processing (0 = auto-detect)",
 		Default:  0,
+	})
+	queryBufferSize := parser.Int("", "query-buffer-size", &argparse.Options{
+		Required: false,
+		Help:     "Query buffer size in bytes",
+		Default:  8192,
+	})
+	asyncMirrors := parser.Flag("", "async-mirrors", &argparse.Options{
+		Required: false,
+		Help:     "Process mirror queries asynchronously (don't block primary response)",
+	})
+	mirrorTimeout := parser.Int("", "mirror-timeout", &argparse.Options{
+		Required: false,
+		Help:     "Timeout for mirror operations in seconds",
+		Default:  120,  // Increased to 2 minutes
+	})
+	mirrorRetries := parser.Int("", "mirror-retries", &argparse.Options{
+		Required: false,
+		Help:     "Number of retries for failed mirror operations",
+		Default:  2,
+	})
+	retryDelay := parser.Int("", "retry-delay", &argparse.Options{
+		Required: false,
+		Help:     "Delay between retries in seconds",
+		Default:  5,
 	})
 
 	// Parse input
@@ -69,6 +101,7 @@ func main() {
 		fmt.Printf("EXAMPLE\nfrenzy --listen :5432 --primary postgresql://postgres:password@localhost:5441/postgres --mirror postgresql://postgres:password@localhost:5442/postgres\n")
 		fmt.Printf("WITH TLS\nfrenzy --listen :5432 --enable-tls --tls-cert server.crt --tls-key server.key --tls-ca ca.pem --primary postgresql://postgres:password@localhost:5441/postgres --mirror postgresql://postgres:password@localhost:5442/postgres\n")
 		fmt.Printf("WITH CONNECTION POOL\nfrenzy --listen :5432 --max-conns 20 --min-conns 5 --max-conn-lifetime 3600 --max-conn-idle-time 1800 --primary postgresql://postgres:password@localhost:5441/postgres --mirror postgresql://postgres:password@localhost:5442/postgres\n")
+		fmt.Printf("HIGH PERFORMANCE\nfrenzy --listen :5432 --max-conns 100 --min-conns 20 --worker-threads 16 --async-mirrors --query-buffer-size 16384 --primary postgresql://postgres:password@localhost:5441/postgres --mirror postgresql://postgres:password@localhost:5442/postgres\n")
 		os.Exit(1)
 	}
 
@@ -106,13 +139,36 @@ func main() {
 		MaxConnIdleTime: time.Duration(*maxConnIdleTime) * time.Second,
 	}
 
+	// Create performance configuration
+	performanceConfig := &server.PerformanceConfig{
+		WorkerThreads:     *workerThreads,
+		QueryBufferSize:   *queryBufferSize,
+		AsyncMirrors:      *asyncMirrors,
+		MirrorTimeoutSecs: *mirrorTimeout,
+		MirrorRetries:     *mirrorRetries,
+		RetryDelaySecs:    *retryDelay,
+	}
+
+	// Auto-detect worker threads if not specified
+	if performanceConfig.WorkerThreads == 0 {
+		performanceConfig.WorkerThreads = runtime.NumCPU()
+	}
+
 	logger.Info("Connection pool configuration",
 		zap.Int32("max_conns", poolConfig.MaxConns),
 		zap.Int32("min_conns", poolConfig.MinConns),
 		zap.Duration("max_conn_lifetime", poolConfig.MaxConnLifetime),
 		zap.Duration("max_conn_idle_time", poolConfig.MaxConnIdleTime))
 
-	server := server.NewProxyServerWithPoolConfig(logger, poolConfig)
+	logger.Info("Performance configuration",
+		zap.Int("worker_threads", performanceConfig.WorkerThreads),
+		zap.Int("query_buffer_size", performanceConfig.QueryBufferSize),
+		zap.Bool("async_mirrors", performanceConfig.AsyncMirrors),
+		zap.Int("mirror_timeout_secs", performanceConfig.MirrorTimeoutSecs),
+		zap.Int("mirror_retries", performanceConfig.MirrorRetries),
+		zap.Int("retry_delay_secs", performanceConfig.RetryDelaySecs))
+
+	server := server.NewProxyServerWithConfigs(logger, poolConfig, performanceConfig)
 	server.ListenAndServeWithTLS(context.Background(), *listenAddress, *primaryAddress, *mirrorsAddresses, tlsConfig)
 	defer server.Close(context.Background())
 }
@@ -155,7 +211,7 @@ func configureTLS(certFile, keyFile, caFile, serverName string, skipVerify bool)
 func configureLogger() (*zap.Logger, error) {
 	config := zap.NewDevelopmentConfig()
 	
-	// Support setting log level through environment variables
+	// 支持通过环境变量设置日志级别
 	logLevel := os.Getenv("FRENZY_LOG_LEVEL")
 	switch strings.ToLower(logLevel) {
 	case "debug":
@@ -167,7 +223,7 @@ func configureLogger() (*zap.Logger, error) {
 	case "error":
 		config.Level = zap.NewAtomicLevelAt(zap.ErrorLevel)
 	default:
-		// Use INFO level by default (disable debug logs)
+		// 默认使用 INFO 级别（关闭 debug 日志）
 		config.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
 	}
 	
