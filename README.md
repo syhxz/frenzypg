@@ -7,7 +7,7 @@ _/ ____\______   ____   ____ ___________.__.
                     \/     \/      \/\/     
 ```
 
-A Postgres wire protocol aware mirroring proxy with SSL/TLS support.
+A Postgres wire protocol aware mirroring proxy with SSL/TLS support.Add SSL/TLS and connection pool support on frenzy.
 
 # Getting started
 Frenzy is an experimental Postgres mirroring proxy that allows mirroring production traffic to shadow instances. Frenzy allows you to service production traffic from a `primary` while measuring one or more `mirror` shadow instances.
