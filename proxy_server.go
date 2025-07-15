@@ -8,29 +8,41 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	wire "github.com/jeroenrinzema/psql-wire"
 	"go.uber.org/zap"
 )
 
 type ProxyServer struct {
-	logger     *zap.Logger
-	primary    *Connection
-	mirrors    []*Connection
-	poolConfig *PoolConfig // Connection pool configuration
+	logger           *zap.Logger
+	primary          *Connection
+	mirrors          []*Connection
+	poolConfig       *PoolConfig // Connection pool configuration
+	performanceConfig *PerformanceConfig // Performance optimization settings
 }
 
 func NewProxyServer(logger *zap.Logger) *ProxyServer {
 	return &ProxyServer{
-		logger:     logger,
-		poolConfig: DefaultPoolConfig(),
+		logger:           logger,
+		poolConfig:       DefaultPoolConfig(),
+		performanceConfig: DefaultPerformanceConfig(),
 	}
 }
 
 func NewProxyServerWithPoolConfig(logger *zap.Logger, poolConfig *PoolConfig) *ProxyServer {
 	return &ProxyServer{
-		logger:     logger,
-		poolConfig: poolConfig,
+		logger:           logger,
+		poolConfig:       poolConfig,
+		performanceConfig: DefaultPerformanceConfig(),
+	}
+}
+
+func NewProxyServerWithConfigs(logger *zap.Logger, poolConfig *PoolConfig, perfConfig *PerformanceConfig) *ProxyServer {
+	return &ProxyServer{
+		logger:           logger,
+		poolConfig:       poolConfig,
+		performanceConfig: perfConfig,
 	}
 }
 
@@ -159,6 +171,114 @@ func (server *ProxyServer) connectToMirrors(
 	return nil
 }
 
+// executeMirrorWithRetry executes a query on a mirror with retry logic
+func (server *ProxyServer) executeMirrorWithRetry(mirrorIndex int, mirror *Connection, query string, isSimpleCommand bool) {
+	maxRetries := server.performanceConfig.MirrorRetries
+	retryDelay := time.Duration(server.performanceConfig.RetryDelaySecs) * time.Second
+	timeout := time.Duration(server.performanceConfig.MirrorTimeoutSecs) * time.Second
+	
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Create context with timeout for each attempt
+		mirrorCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		
+		var err error
+		if isSimpleCommand {
+			err = mirror.ExecuteSimpleCommand(mirrorCtx, query)
+		} else {
+			err = mirror.ExecuteQuery(mirrorCtx, query, nil) // No writer for mirrors
+		}
+		
+		cancel() // Always cancel the context
+		
+		if err == nil {
+			// Success
+			if attempt > 0 {
+				server.logger.Info("Mirror operation succeeded after retry",
+					zap.Int("mirror_index", mirrorIndex),
+					zap.Int("attempt", attempt+1),
+					zap.String("query", query))
+			}
+			return
+		}
+		
+		// Log the error
+		if attempt < maxRetries {
+			server.logger.Warn("Mirror operation failed, retrying",
+				zap.Int("mirror_index", mirrorIndex),
+				zap.Int("attempt", attempt+1),
+				zap.Int("max_retries", maxRetries),
+				zap.Duration("retry_delay", retryDelay),
+				zap.Error(err))
+			
+			// Wait before retry
+			time.Sleep(retryDelay)
+		} else {
+			server.logger.Error("Mirror operation failed after all retries",
+				zap.Int("mirror_index", mirrorIndex),
+				zap.Int("total_attempts", attempt+1),
+				zap.String("query", query),
+				zap.Error(err))
+		}
+	}
+}
+
+// executeMirrorCommandWithRetry executes a simple command on a mirror with retry logic
+func (server *ProxyServer) executeMirrorCommandWithRetry(mirrorIndex int, mirror *Connection, command string, commandIndex int, isMultiCommand bool) {
+	maxRetries := server.performanceConfig.MirrorRetries
+	retryDelay := time.Duration(server.performanceConfig.RetryDelaySecs) * time.Second
+	timeout := time.Duration(server.performanceConfig.MirrorTimeoutSecs) * time.Second
+	
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Create context with timeout for each attempt
+		mirrorCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		
+		err := mirror.ExecuteSimpleCommand(mirrorCtx, command)
+		cancel() // Always cancel the context
+		
+		if err == nil {
+			// Success
+			if attempt > 0 {
+				server.logger.Info("Mirror command succeeded after retry",
+					zap.Int("mirror_index", mirrorIndex),
+					zap.Int("command_index", commandIndex),
+					zap.Int("attempt", attempt+1),
+					zap.String("command", command))
+			}
+			return
+		}
+		
+		// Log the error
+		if attempt < maxRetries {
+			server.logger.Warn("Mirror command failed, retrying",
+				zap.Int("mirror_index", mirrorIndex),
+				zap.Int("command_index", commandIndex),
+				zap.Int("attempt", attempt+1),
+				zap.Int("max_retries", maxRetries),
+				zap.Duration("retry_delay", retryDelay),
+				zap.String("command", command),
+				zap.Error(err))
+			
+			// Wait before retry
+			time.Sleep(retryDelay)
+		} else {
+			if isMultiCommand {
+				server.logger.Error("Mirror multi-command query failed after all retries",
+					zap.Int("mirror_index", mirrorIndex),
+					zap.Int("command_index", commandIndex),
+					zap.Int("total_attempts", attempt+1),
+					zap.String("command", command),
+					zap.Error(err))
+			} else {
+				server.logger.Error("Mirror command failed after all retries",
+					zap.Int("mirror_index", mirrorIndex),
+					zap.Int("total_attempts", attempt+1),
+					zap.String("command", command),
+					zap.Error(err))
+			}
+		}
+	}
+}
+
 func (server *ProxyServer) Close(ctx context.Context) error {
 	for _, mirror := range server.mirrors {
 		err := mirror.Close(ctx)
@@ -212,13 +332,24 @@ func (server *ProxyServer) handleLegacy(
 		return err
 	}
 	
-	for i, mirror := range server.mirrors {
-		err := mirror.ExecuteQuery(ctx, query, writer)
-		if err != nil {
-			server.logger.Error("Mirror query failed", 
-				zap.Int("mirror_index", i), 
-				zap.Error(err))
-			// 继续执行，不要因为镜像失败而中断
+	// Execute on mirrors - async or sync based on configuration
+	if server.performanceConfig.AsyncMirrors {
+		// Asynchronous mirror processing (fire and forget)
+		for i, mirror := range server.mirrors {
+			go func(mirrorIndex int, m *Connection) {
+				server.executeMirrorWithRetry(mirrorIndex, m, query, false)
+			}(i, mirror)
+		}
+	} else {
+		// Synchronous mirror processing (original behavior)
+		for i, mirror := range server.mirrors {
+			err := mirror.ExecuteQuery(ctx, query, writer)
+			if err != nil {
+				server.logger.Error("Mirror query failed", 
+					zap.Int("mirror_index", i), 
+					zap.Error(err))
+				// Continue execution, don't interrupt due to mirror failure
+			}
 		}
 	}
 	return nil
@@ -288,16 +419,26 @@ func (server *ProxyServer) handleMultiCommandQuery(ctx context.Context, query st
 			}
 		}
 		
-		// Execute on mirrors (always use simple execution)
-		for j, mirror := range server.mirrors {
-			err := mirror.ExecuteSimpleCommand(ctx, cmd)
-			if err != nil {
-				server.logger.Error("Mirror multi-command query failed", 
-					zap.Int("mirror_index", j),
-					zap.Int("command_index", i+1),
-					zap.String("command", cmd),
-					zap.Error(err))
-				// Mirror failures don't affect main query
+		// Execute on mirrors - async or sync based on configuration
+		if server.performanceConfig.AsyncMirrors {
+			// Asynchronous mirror processing
+			for j, mirror := range server.mirrors {
+				go func(mirrorIndex int, m *Connection, command string, cmdIndex int) {
+					server.executeMirrorCommandWithRetry(mirrorIndex, m, command, cmdIndex, true)
+				}(j, mirror, cmd, i+1)
+			}
+		} else {
+			// Synchronous mirror processing (original behavior)
+			for j, mirror := range server.mirrors {
+				err := mirror.ExecuteSimpleCommand(ctx, cmd)
+				if err != nil {
+					server.logger.Error("Mirror multi-command query failed", 
+						zap.Int("mirror_index", j),
+						zap.Int("command_index", i+1),
+						zap.String("command", cmd),
+						zap.Error(err))
+					// Mirror failures don't affect main query
+				}
 			}
 		}
 	}
