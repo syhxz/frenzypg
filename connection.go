@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -15,6 +16,47 @@ import (
 	"github.com/lib/pq/oid"
 	"go.uber.org/zap"
 )
+
+// Memory pools for buffer reuse to reduce GC pressure
+var (
+	queryBufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 0, 4096)
+		},
+	}
+	
+	stringBuilderPool = sync.Pool{
+		New: func() interface{} {
+			return &strings.Builder{}
+		},
+	}
+)
+
+// GetQueryBuffer gets a buffer from the pool
+func GetQueryBuffer() []byte {
+	return queryBufferPool.Get().([]byte)[:0]
+}
+
+// PutQueryBuffer returns a buffer to the pool
+func PutQueryBuffer(buf []byte) {
+	if cap(buf) <= 8192 { // Don't pool very large buffers
+		queryBufferPool.Put(buf)
+	}
+}
+
+// GetStringBuilder gets a string builder from the pool
+func GetStringBuilder() *strings.Builder {
+	sb := stringBuilderPool.Get().(*strings.Builder)
+	sb.Reset()
+	return sb
+}
+
+// PutStringBuilder returns a string builder to the pool
+func PutStringBuilder(sb *strings.Builder) {
+	if sb.Cap() <= 8192 { // Don't pool very large builders
+		stringBuilderPool.Put(sb)
+	}
+}
 
 type ConnectionType int
 
@@ -31,13 +73,35 @@ type PoolConfig struct {
 	MaxConnIdleTime time.Duration
 }
 
-// DefaultPoolConfig returns default connection pool configuration
+// PerformanceConfig holds performance optimization settings
+type PerformanceConfig struct {
+	WorkerThreads     int
+	QueryBufferSize   int
+	AsyncMirrors      bool
+	MirrorTimeoutSecs int // Timeout for mirror operations in seconds
+	MirrorRetries     int // Number of retries for failed mirror operations
+	RetryDelaySecs    int // Delay between retries in seconds
+}
+
+// DefaultPerformanceConfig returns default performance configuration
+func DefaultPerformanceConfig() *PerformanceConfig {
+	return &PerformanceConfig{
+		WorkerThreads:     0,   // Auto-detect based on CPU cores
+		QueryBufferSize:   8192, // 8KB buffer
+		AsyncMirrors:      true, // Enable async mirrors by default
+		MirrorTimeoutSecs: 120,  // 2 minutes timeout for mirrors
+		MirrorRetries:     2,    // Retry failed mirror operations twice
+		RetryDelaySecs:    5,    // 5 second delay between retries
+	}
+}
+
+// DefaultPoolConfig returns default connection pool configuration optimized for high concurrency
 func DefaultPoolConfig() *PoolConfig {
 	return &PoolConfig{
-		MaxConns:        10,
-		MinConns:        2,
-		MaxConnLifetime: 0, // Never expire
-		MaxConnIdleTime: 0, // Never expire
+		MaxConns:        50,  // Increased from 10 for better concurrency
+		MinConns:        10,  // Increased from 2 for better connection availability
+		MaxConnLifetime: 0,   // Never expire
+		MaxConnIdleTime: 300 * time.Second, // 5 minutes idle timeout
 	}
 }
 
