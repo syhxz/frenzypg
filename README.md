@@ -8,6 +8,10 @@ _/ ____\______   ____   ____ ___________.__.
 ```
 
 A high-performance Postgres wire protocol aware mirroring proxy with SSL/TLS support, connection pooling, and advanced retry mechanisms.
+1.upgrade v0.5.3 to v0.15.0.
+2.support mirror different queries by Arguments .
+3.Skip BEGIN/COMMIT on mirrors to avoid transaction locks.
+4.connection pool optimize.
 
 # Features
 
