@@ -186,7 +186,7 @@ func (tac *TransactionAwareConnection) getSessionConnection(ctx context.Context,
 	
 	tac.logger.Debug("Created new session connection", 
 		zap.String("session", sessionID),
-		zap.String("connection_type", string(tac.connectionType)))
+		zap.String("connection_type", connectionTypeName(tac.connectionType)))
 	
 	return conn, nil
 }
@@ -369,6 +369,6 @@ func (tac *TransactionAwareConnection) performCleanup() {
 		tac.logger.Info("Cleaned up expired transaction-aware sessions", 
 			zap.Int("cleaned_sessions", cleanedCount),
 			zap.Int("remaining_sessions", len(tac.sessionConnections)),
-			zap.String("connection_type", string(tac.connectionType)))
+			zap.String("connection_type", connectionTypeName(tac.connectionType)))
 	}
 }

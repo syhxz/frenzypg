@@ -5,16 +5,17 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"net/url"
 	"os"
+	"os/signal"
 	"runtime"
-	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/akamensky/argparse"
-	"github.com/kellabyte/frenzy/server"
+	"github.com/syhxz/frenzypg/server"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -30,7 +31,7 @@ func main() {
 	listenAddress := parser.String("l", "listen", &argparse.Options{Required: true, Help: "Listening port."})
 	primaryAddress := parser.String("p", "primary", &argparse.Options{Required: true, Help: "Primary Postgres connection string."})
 	var mirrorsAddresses *[]string = parser.StringList("m", "mirror", &argparse.Options{Required: true, Help: "Mirror Postgres connection string."})
-	
+
 	// SSL/TLS configuration options
 	tlsCertFile := parser.String("", "tls-cert", &argparse.Options{Required: false, Help: "TLS certificate file path."})
 	tlsKeyFile := parser.String("", "tls-key", &argparse.Options{Required: false, Help: "TLS private key file path."})
@@ -58,7 +59,7 @@ func main() {
 	maxConnIdleTime := parser.Int("", "max-conn-idle-time", &argparse.Options{
 		Required: false,
 		Help:     "Maximum connection idle time in seconds (0 means never expire)",
-		Default:  300,  // Changed default to 5 minutes
+		Default:  300,
 	})
 
 	// Performance optimization options
@@ -79,7 +80,7 @@ func main() {
 	mirrorTimeout := parser.Int("", "mirror-timeout", &argparse.Options{
 		Required: false,
 		Help:     "Timeout for mirror operations in seconds",
-		Default:  120,  // Increased to 2 minutes
+		Default:  120,
 	})
 	mirrorRetries := parser.Int("", "mirror-retries", &argparse.Options{
 		Required: false,
@@ -125,13 +126,9 @@ func main() {
 	// Parse input
 	err = parser.Parse(os.Args)
 	if err != nil {
-		// In case of error print error and print usage
-		// This can also be done by passing -h or --help flags
 		fmt.Print(parser.Usage(err))
 		fmt.Printf("EXAMPLE\nfrenzy --listen :5432 --primary postgresql://postgres:password@localhost:5441/postgres --mirror postgresql://postgres:password@localhost:5442/postgres\n")
 		fmt.Printf("WITH TLS\nfrenzy --listen :5432 --enable-tls --tls-cert server.crt --tls-key server.key --tls-ca ca.pem --primary postgresql://postgres:password@localhost:5441/postgres --mirror postgresql://postgres:password@localhost:5442/postgres\n")
-		fmt.Printf("WITH CONNECTION POOL\nfrenzy --listen :5432 --max-conns 20 --min-conns 5 --max-conn-lifetime 3600 --max-conn-idle-time 1800 --primary postgresql://postgres:password@localhost:5441/postgres --mirror postgresql://postgres:password@localhost:5442/postgres\n")
-		fmt.Printf("HIGH PERFORMANCE\nfrenzy --listen :5432 --max-conns 100 --min-conns 20 --worker-threads 16 --async-mirrors --query-buffer-size 16384 --primary postgresql://postgres:password@localhost:5441/postgres --mirror postgresql://postgres:password@localhost:5442/postgres\n")
 		os.Exit(1)
 	}
 
@@ -148,13 +145,13 @@ func main() {
 	mirrors := *mirrorsAddresses
 	logFields := make([]zapcore.Field, 0)
 	logFields = append(logFields, zap.String("listen", *listenAddress))
-	logFields = append(logFields, zap.String("primary", *primaryAddress))
+	logFields = append(logFields, zap.String("primary", maskConnectionString(*primaryAddress)))
 	logFields = append(logFields, zap.Bool("tls_enabled", *enableTLS))
 	for index, mirror := range mirrors {
 		field := zapcore.Field{
-			Key:    "mirror-" + strconv.Itoa((index + 1)),
+			Key:    "mirror-" + fmt.Sprintf("%d", index+1),
 			Type:   zapcore.StringType,
-			String: mirror,
+			String: maskConnectionString(mirror),
 		}
 		logFields = append(logFields, field)
 	}
@@ -216,12 +213,49 @@ func main() {
 		SkipMirrorTxLocks:   *skipMirrorTxLocks,
 	}
 
-	server := server.NewProxyServerV15(logger)
-	server.SetPoolConfig(poolConfig)
-	server.SetPerformanceConfig(performanceConfig)
-	server.SetQueryFilterConfig(queryFilterConfig)
-	server.ListenAndServe(context.Background(), *listenAddress, *primaryAddress, *mirrorsAddresses, tlsConfig)
-	defer server.Close(context.Background())
+	srv := server.NewProxyServerV15(logger)
+	srv.SetPoolConfig(poolConfig)
+	srv.SetPerformanceConfig(performanceConfig)
+	srv.SetQueryFilterConfig(queryFilterConfig)
+
+	// Graceful shutdown on SIGINT/SIGTERM
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		logger.Info("Received shutdown signal", zap.String("signal", sig.String()))
+		srv.Close(ctx)
+		cancel()
+		os.Exit(0)
+	}()
+
+	if err := srv.ListenAndServe(ctx, *listenAddress, *primaryAddress, *mirrorsAddresses, tlsConfig); err != nil {
+		logger.Fatal("Server failed", zap.Error(err))
+	}
+}
+
+// maskConnectionString masks the password in a connection string for safe logging
+func maskConnectionString(connStr string) string {
+	u, err := url.Parse(connStr)
+	if err != nil {
+		if strings.Contains(connStr, "password=") {
+			parts := strings.Split(connStr, " ")
+			for i, part := range parts {
+				if strings.HasPrefix(part, "password=") {
+					parts[i] = "password=***"
+				}
+			}
+			return strings.Join(parts, " ")
+		}
+		return connStr
+	}
+	if u.User != nil {
+		u.User = url.UserPassword(u.User.Username(), "***")
+	}
+	return u.String()
 }
 
 func configureTLS(certFile, keyFile, caFile, serverName string, skipVerify bool) (*tls.Config, error) {
@@ -231,7 +265,6 @@ func configureTLS(certFile, keyFile, caFile, serverName string, skipVerify bool)
 		MinVersion:         tls.VersionTLS12,
 	}
 
-	// Load server certificate and key if provided
 	if certFile != "" && keyFile != "" {
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
@@ -240,9 +273,8 @@ func configureTLS(certFile, keyFile, caFile, serverName string, skipVerify bool)
 		tlsConfig.Certificates = []tls.Certificate{cert}
 	}
 
-	// Load CA certificate if provided
 	if caFile != "" {
-		caCert, err := ioutil.ReadFile(caFile)
+		caCert, err := os.ReadFile(caFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read CA certificate: %w", err)
 		}
@@ -261,8 +293,7 @@ func configureTLS(certFile, keyFile, caFile, serverName string, skipVerify bool)
 
 func configureLogger() (*zap.Logger, error) {
 	config := zap.NewDevelopmentConfig()
-	
-	// 支持通过环境变量设置日志级别
+
 	logLevel := os.Getenv("FRENZY_LOG_LEVEL")
 	switch strings.ToLower(logLevel) {
 	case "debug":
@@ -274,10 +305,9 @@ func configureLogger() (*zap.Logger, error) {
 	case "error":
 		config.Level = zap.NewAtomicLevelAt(zap.ErrorLevel)
 	default:
-		// 默认使用 INFO 级别（关闭 debug 日志）
 		config.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
 	}
-	
+
 	config.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	logger, err := config.Build()
 	return logger.Named("frenzy"), err

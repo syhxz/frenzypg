@@ -5,16 +5,19 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"runtime"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	wire "github.com/jeroenrinzema/psql-wire"
 	"github.com/lib/pq/oid"
 	"go.uber.org/zap"
 )
+
+type sessionIDKey struct{}
+
+var sessionCounter uint64
 
 // QueryFilterConfig defines query filtering options
 type QueryFilterConfig struct {
@@ -215,15 +218,12 @@ func (server *ProxyServerV15) getQueryColumns(ctx context.Context, query string)
 	}
 	defer conn.Release()
 
-	// Execute query with LIMIT 0 to get column information only
-	limitQuery := query + " LIMIT 0"
+	// Execute query wrapped as subquery with LIMIT 0 to get column information only
+	limitQuery := fmt.Sprintf("SELECT * FROM (%s) AS _col_detect LIMIT 0", query)
 	rows, err := conn.Query(ctx, limitQuery)
 	if err != nil {
-		// If LIMIT 0 fails, try the original query approach
-		rows, err = conn.Query(ctx, query)
-		if err != nil {
-			return wire.Columns{}, fmt.Errorf("failed to execute query for columns: %w", err)
-		}
+		// If subquery fails, return empty columns rather than executing full query
+		return wire.Columns{}, nil
 	}
 	defer rows.Close()
 
@@ -320,7 +320,11 @@ func (server *ProxyServerV15) executeQuery(ctx context.Context, query string, wr
 
 // executeMirrorQueriesWithTransactionSupport executes query on all mirrors with transaction support
 func (server *ProxyServerV15) executeMirrorQueriesWithTransactionSupport(ctx context.Context, query string, parameters []wire.Parameter) {
-	cmdType := strings.ToUpper(strings.TrimSpace(strings.Fields(query)[0]))
+	fields := strings.Fields(strings.TrimSpace(query))
+	if len(fields) == 0 {
+		return
+	}
+	cmdType := strings.ToUpper(fields[0])
 	server.logger.Debug("Executing on mirrors", 
 		zap.String("query", query),
 		zap.Int("mirror_count", len(server.mirrors)))
@@ -449,32 +453,37 @@ func (server *ProxyServerV15) commitTransactionBuffer(sessionID string) {
 			} else {
 				// Use a temporary connection for the entire transaction
 				for _, mirror := range server.txAwareMirrors {
-					conn, err := mirror.pool.Acquire(context.Background())
+					if mirror == nil {
+						continue
+					}
+					conn, err := mirror.pool.Acquire(ctx)
 					if err != nil {
 						server.logger.Error("Failed to acquire mirror connection", zap.Error(err))
 						continue
 					}
-					
+
 					// Execute entire transaction on this connection
-					_, err = conn.Exec(context.Background(), "BEGIN")
+					_, err = conn.Exec(ctx, "BEGIN")
 					if err != nil {
 						conn.Release()
 						continue
 					}
-					
+
+					txFailed := false
 					for _, query := range buffer.Queries {
-						_, err = conn.Exec(context.Background(), query)
+						_, err = conn.Exec(ctx, query)
 						if err != nil {
 							server.logger.Error("Mirror query failed", zap.String("query", query), zap.Error(err))
-							conn.Exec(context.Background(), "ROLLBACK")
+							conn.Exec(ctx, "ROLLBACK")
+							txFailed = true
 							break
 						}
 					}
-					
-					if err == nil {
-						_, err = conn.Exec(context.Background(), "COMMIT")
+
+					if !txFailed {
+						_, _ = conn.Exec(ctx, "COMMIT")
 					}
-					
+
 					conn.Release()
 				}
 			}
@@ -511,36 +520,42 @@ func (server *ProxyServerV15) executeMirrorQueriesWithSession(ctx context.Contex
 	
 	// Use transaction-aware mirrors if available
 	if len(server.txAwareMirrors) > 0 {
+		var wg sync.WaitGroup
 		for i, mirror := range server.txAwareMirrors {
+			if mirror == nil {
+				continue
+			}
+			wg.Add(1)
 			go func(mirrorIndex int, tm *TransactionAwareConnection) {
+				defer wg.Done()
 				defer func() {
 					if r := recover(); r != nil {
-						server.logger.Error("Mirror goroutine panic", 
+						server.logger.Error("Mirror goroutine panic",
 							zap.Int("mirror_index", mirrorIndex),
 							zap.String("session", sessionID),
 							zap.Any("panic", r))
 					}
 				}()
-				
+
 				err := tm.ExecuteQueryWithSession(mirrorCtx, sessionID, query, nil, parameters)
 				if err != nil {
-					server.logger.Error("Mirror query failed", 
+					server.logger.Error("Mirror query failed",
 						zap.Int("mirror_index", mirrorIndex),
 						zap.String("session", sessionID),
 						zap.String("query", query),
 						zap.Error(err))
 				} else {
-					server.logger.Debug("Mirror query succeeded", 
+					server.logger.Debug("Mirror query succeeded",
 						zap.Int("mirror_index", mirrorIndex),
 						zap.String("session", sessionID),
 						zap.String("query", query))
 				}
 			}(i, mirror)
 		}
-		
-		// Cancel context after a delay to allow goroutines to complete
+
+		// Wait for all goroutines to complete, then cancel context
 		go func() {
-			time.Sleep(35 * time.Second)
+			wg.Wait()
 			cancel()
 		}()
 	} else {
@@ -571,21 +586,13 @@ func (server *ProxyServerV15) executeMirrorQueriesWithSession(ctx context.Contex
 
 // Helper function to get session ID from context
 func getSessionIDFromContext(ctx context.Context) string {
-	// Extract session ID from context or generate unique one based on goroutine
-	if sessionID := ctx.Value("session_id"); sessionID != nil {
-		return sessionID.(string)
+	// Extract session ID from context
+	if sessionID, ok := ctx.Value(sessionIDKey{}).(string); ok && sessionID != "" {
+		return sessionID
 	}
-	// Use goroutine ID as session identifier for connection affinity
-	return fmt.Sprintf("session_%d", getGoroutineID())
-}
-
-// getGoroutineID returns current goroutine ID for session tracking
-func getGoroutineID() int64 {
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	idField := strings.Fields(strings.TrimPrefix(string(buf[:n]), "goroutine "))[0]
-	id, _ := strconv.ParseInt(idField, 10, 64)
-	return id
+	// Generate unique session ID using atomic counter
+	id := atomic.AddUint64(&sessionCounter, 1)
+	return fmt.Sprintf("session_%d_%d", time.Now().UnixNano(), id)
 }
 
 // shouldMirrorQuery determines if a query should be mirrored based on configuration
@@ -736,16 +743,30 @@ func (server *ProxyServerV15) Close(ctx context.Context) error {
 	if server.primary != nil {
 		server.primary.Close(ctx)
 	}
-	
+
+	if server.txAwarePrimary != nil {
+		server.txAwarePrimary.Close()
+	}
+
 	for _, mirror := range server.mirrors {
 		if mirror != nil {
 			mirror.Close(ctx)
 		}
 	}
-	
+
+	for _, txMirror := range server.txAwareMirrors {
+		if txMirror != nil {
+			txMirror.Close()
+		}
+	}
+
+	if server.sessionManager != nil {
+		server.sessionManager.Close()
+	}
+
 	// Stop cleanup routine
 	server.stopCleanupRoutine()
-	
+
 	return nil
 }
 

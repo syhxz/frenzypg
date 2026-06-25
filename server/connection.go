@@ -5,7 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"net/url"
 	"strings"
 	"sync"
@@ -65,6 +65,17 @@ const (
 	Primary ConnectionType = iota
 	Mirror
 )
+
+func connectionTypeName(ct ConnectionType) string {
+	switch ct {
+	case Primary:
+		return "primary"
+	case Mirror:
+		return "mirror"
+	default:
+		return "unknown"
+	}
+}
 
 // PoolConfig holds connection pool configuration
 type PoolConfig struct {
@@ -294,7 +305,7 @@ func (connection *Connection) configurePoolSSL(config *pgxpool.Config, connectio
 
 			// Load root certificate if provided
 			if sslRootCert != "" {
-				caCert, err := ioutil.ReadFile(sslRootCert)
+				caCert, err := os.ReadFile(sslRootCert)
 				if err != nil {
 					return err
 				}
@@ -355,7 +366,7 @@ func (connection *Connection) parsePoolSSLFromKeyValue(config *pgxpool.Config, c
 
 		// Load root certificate if provided
 		if sslRootCert, exists := sslParams["sslrootcert"]; exists {
-			caCert, err := ioutil.ReadFile(sslRootCert)
+			caCert, err := os.ReadFile(sslRootCert)
 			if err != nil {
 				return err
 			}
@@ -409,7 +420,7 @@ func (connection *Connection) parseSSLFromKeyValue(config *pgx.ConnConfig, conne
 
 		// Load root certificate if provided
 		if sslRootCert, exists := sslParams["sslrootcert"]; exists {
-			caCert, err := ioutil.ReadFile(sslRootCert)
+			caCert, err := os.ReadFile(sslRootCert)
 			if err != nil {
 				return err
 			}
@@ -517,9 +528,6 @@ func (connection *Connection) executePrimaryQueryWithTransactionSupport(
 	_, cmdType := IsTransactionCommand(query)
 	
 	// Transaction-level connection management
-	if sessionID == "" {
-		sessionID = fmt.Sprintf("session_%p", ctx)
-	}
 
 	var conn *pgxpool.Conn
 	var err error

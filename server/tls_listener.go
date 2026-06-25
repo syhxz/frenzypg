@@ -257,23 +257,23 @@ func (c *LoggingConn) Close() error {
 type ConnectionWithBuffer struct {
 	net.Conn
 	buffer     []byte
-	bufferUsed bool
+	bufferPos  int
 	logger     *zap.Logger
 	remoteAddr string
 }
 
 // Read reads from buffer first, then from connection
 func (c *ConnectionWithBuffer) Read(b []byte) (n int, err error) {
-	// If we have buffered data and haven't used it yet
-	if !c.bufferUsed && len(c.buffer) > 0 {
-		c.bufferUsed = true
-		n = copy(b, c.buffer)
+	// If we have buffered data remaining
+	if c.bufferPos < len(c.buffer) {
+		n = copy(b, c.buffer[c.bufferPos:])
+		c.bufferPos += n
 		c.logger.Debug("Reading from buffer",
 			zap.String("remote_addr", c.remoteAddr),
 			zap.Int("bytes", n))
 		return n, nil
 	}
-	
+
 	// Read from actual connection
 	n, err = c.Conn.Read(b)
 	if err != nil {

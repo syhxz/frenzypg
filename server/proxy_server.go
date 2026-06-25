@@ -374,9 +374,9 @@ func (server *ProxyServer) handleLegacy(
 	return nil
 }
 
-// isMultiCommandQuery 检查查询是否包含多个命令
+// isMultiCommandQuery checks if a query contains multiple commands
 func (server *ProxyServer) isMultiCommandQuery(query string) bool {
-	// 清理查询字符串
+	// Clean query string
 	trimmed := strings.TrimSpace(query)
 	if trimmed == "" {
 		return false
@@ -420,7 +420,7 @@ func (server *ProxyServer) handleMultiCommandQuery(ctx context.Context, query st
 					zap.String("command", cmd),
 					zap.Error(err))
 				lastError = err
-				// 对于结果命令失败，直接返回错误
+				// For result command failure, return error immediately
 				return err
 			} else {
 				hasResults = true

@@ -1,4 +1,4 @@
-module github.com/kellabyte/frenzy
+module github.com/syhxz/frenzypg
 
 go 1.23.0
 

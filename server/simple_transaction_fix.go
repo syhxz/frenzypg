@@ -2,18 +2,27 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
 
-// SimpleTransactionTracker tracks transaction state per connection
+// trackedConn holds transaction state and last-used time for a connection
+type trackedConn struct {
+	state    TransactionState
+	lastUsed time.Time
+}
+
+// SimpleTransactionTracker tracks transaction state per connection using PID-based keys
 type SimpleTransactionTracker struct {
-	connectionStates map[*pgxpool.Conn]TransactionState
-	mutex           sync.RWMutex
-	logger          *zap.Logger
+	connectionStates map[string]trackedConn
+	mutex            sync.RWMutex
+	logger           *zap.Logger
+	stopCleanup      chan struct{}
 }
 
 var globalTransactionTracker *SimpleTransactionTracker
@@ -22,11 +31,18 @@ var trackerOnce sync.Once
 func GetTransactionTracker(logger *zap.Logger) *SimpleTransactionTracker {
 	trackerOnce.Do(func() {
 		globalTransactionTracker = &SimpleTransactionTracker{
-			connectionStates: make(map[*pgxpool.Conn]TransactionState),
-			logger:          logger,
+			connectionStates: make(map[string]trackedConn),
+			logger:           logger,
+			stopCleanup:      make(chan struct{}),
 		}
+		go globalTransactionTracker.cleanupLoop()
 	})
 	return globalTransactionTracker
+}
+
+// connKey generates a stable string key from a connection's backend PID
+func connKey(conn *pgxpool.Conn) string {
+	return fmt.Sprintf("pid_%d", conn.Conn().PgConn().PID())
 }
 
 func (stt *SimpleTransactionTracker) UpdateConnectionState(conn *pgxpool.Conn, query string) {
@@ -34,40 +50,63 @@ func (stt *SimpleTransactionTracker) UpdateConnectionState(conn *pgxpool.Conn, q
 	defer stt.mutex.Unlock()
 
 	trimmed := strings.TrimSpace(strings.ToUpper(query))
-	
+	key := connKey(conn)
+
 	if strings.HasPrefix(trimmed, "BEGIN") || strings.HasPrefix(trimmed, "START TRANSACTION") {
-		stt.connectionStates[conn] = TransactionInProgress
-		stt.logger.Debug("Transaction started on connection", zap.String("query", query))
+		stt.connectionStates[key] = trackedConn{state: TransactionInProgress, lastUsed: time.Now()}
+		stt.logger.Debug("Transaction started on connection", zap.String("key", key))
 	} else if strings.HasPrefix(trimmed, "COMMIT") {
-		stt.connectionStates[conn] = TransactionIdle
-		stt.logger.Debug("Transaction committed on connection", zap.String("query", query))
+		delete(stt.connectionStates, key)
+		stt.logger.Debug("Transaction committed on connection", zap.String("key", key))
 	} else if strings.HasPrefix(trimmed, "ROLLBACK") {
-		stt.connectionStates[conn] = TransactionIdle
-		stt.logger.Debug("Transaction rolled back on connection", zap.String("query", query))
+		delete(stt.connectionStates, key)
+		stt.logger.Debug("Transaction rolled back on connection", zap.String("key", key))
 	}
 }
 
 func (stt *SimpleTransactionTracker) IsInTransaction(conn *pgxpool.Conn) bool {
 	stt.mutex.RLock()
 	defer stt.mutex.RUnlock()
-	
-	state, exists := stt.connectionStates[conn]
-	return exists && state == TransactionInProgress
+
+	tc, exists := stt.connectionStates[connKey(conn)]
+	return exists && tc.state == TransactionInProgress
 }
 
 func (stt *SimpleTransactionTracker) CleanupConnection(conn *pgxpool.Conn) {
 	stt.mutex.Lock()
 	defer stt.mutex.Unlock()
-	
-	// If connection is in transaction, it should be rolled back
-	if state, exists := stt.connectionStates[conn]; exists && state == TransactionInProgress {
-		stt.logger.Warn("Connection being cleaned up while in transaction - should rollback")
-		// Execute rollback on the connection before cleanup
+
+	key := connKey(conn)
+	// If connection is in transaction, rollback before cleanup
+	if tc, exists := stt.connectionStates[key]; exists && tc.state == TransactionInProgress {
+		stt.logger.Warn("Connection being cleaned up while in transaction - rolling back")
 		_, err := conn.Exec(context.Background(), "ROLLBACK")
 		if err != nil {
 			stt.logger.Error("Failed to rollback transaction during cleanup", zap.Error(err))
 		}
 	}
-	
-	delete(stt.connectionStates, conn)
+
+	delete(stt.connectionStates, key)
+}
+
+// cleanupLoop periodically removes stale entries
+func (stt *SimpleTransactionTracker) cleanupLoop() {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			stt.mutex.Lock()
+			now := time.Now()
+			for key, tc := range stt.connectionStates {
+				if now.Sub(tc.lastUsed) > 10*time.Minute {
+					delete(stt.connectionStates, key)
+				}
+			}
+			stt.mutex.Unlock()
+		case <-stt.stopCleanup:
+			return
+		}
+	}
 }
