@@ -386,7 +386,7 @@ Client App
 │  │ • Full decode   │    │ • 5-byte header    │  │
 │  │ • Extended QP   │    │ • Zero-copy fwd    │  │
 │  │ • Tx buffering  │    │ • writev syscall   │  │
-│  │ • Column detect │    │ • SimpleQuery only │  │
+│  │ • Column detect │    │ • Simple+Extended │  │
 │  └──────┬──────────┘    └───────┬────────────┘  │
 │         │                       │                │
 │  ┌──────▼───────────────────────▼─────────────┐  │
@@ -456,7 +456,7 @@ frenzypg/
 | Non-deterministic functions (`random()`, `uuid_generate_v4()`) | Values differ between primary and mirror | Expected for statement-level replication |
 | `nextval()` sequence values | Different on primary vs mirror | Acceptable for testing; use WAL replication for exact consistency |
 | `now()` / `current_timestamp` | Slight time difference on mirror | Typically sub-second, acceptable |
-| Extended Query Protocol pipeline mode | Depends on psql-wire library support | Standard clients (psql, JDBC, libpq) work fine |
+| Extended Query Protocol pipeline mode | Wire mode depends on psql-wire library support; Raw mode fully supports (transparent relay) | Use raw mode for pipeline-heavy workloads |
 
 ## Security
 

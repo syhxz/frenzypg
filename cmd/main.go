@@ -672,8 +672,11 @@ func runWithConfig(configPath string) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// Select proxy mode
+	// Select proxy mode (default: raw)
 	mode := strings.ToLower(strings.TrimSpace(cfg.Mode))
+	if mode == "" {
+		mode = "raw"
+	}
 	switch mode {
 	case "raw":
 		logger.Info("Starting in RAW proxy mode (high-performance protocol forwarding)")
