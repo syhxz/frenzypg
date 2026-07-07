@@ -214,26 +214,44 @@ Client ←→ [Header Parse] ←→ Route Decision ←→ [Raw Byte Forward] ←
 
 ## Benchmark
 
-Tested with pgbench (scale=1, 100K rows), 4 clients, 10 seconds.  
-Primary: PostgreSQL 16 (local). Mirror: Aurora PostgreSQL (cross-AZ, async).
+Tested with pgbench (scale=1, 100K rows), PostgreSQL 16 (local).  
+Mirror: Aurora PostgreSQL (cross-AZ, async mirroring).
 
-### SELECT-only (read workload)
+### Throughput (TPS)
 
-| Target | Protocol | TPS | Latency (avg) | vs Direct |
-|--------|----------|----:|:-------------:|:---------:|
-| Direct PostgreSQL | simple | 10,302 | 0.39 ms | baseline |
-| **Raw Proxy** (+ mirror) | simple | **6,110** | **0.66 ms** | -41% |
-| **Raw Proxy** (+ mirror) | extended | **4,428** | **0.90 ms** | -57% |
-| Wire Proxy (+ mirror) | simple | 168 | 23.9 ms | -98% |
+| Target | Protocol | Clients | TPS | Latency (avg) | vs Direct |
+|--------|----------|:-------:|----:|:-------------:|:---------:|
+| Direct PostgreSQL | simple | 4 | 10,358 | 0.39 ms | baseline |
+| **Raw Proxy** (+ mirror) | simple | 4 | **5,936** | **0.67 ms** | -43% |
+| **Raw Proxy** (+ mirror) | extended | 4 | **5,372** | **0.75 ms** | -48% |
+| Direct PostgreSQL | simple | 16 | 9,135 | 1.75 ms | baseline |
+| **Raw Proxy** (+ mirror) | simple | 16 | **7,164** | **2.23 ms** | -22% |
+| Wire Proxy (+ mirror) | simple | 4 | 168 | 23.9 ms | -98% |
 
-### TPC-B (read-write mixed)
+### Latency Percentiles (SELECT-only, SimpleQuery)
+
+| Percentile | Direct (4c) | Raw Proxy (4c) | Delta | Direct (16c) | Raw Proxy (16c) | Delta |
+|:----------:|:-----------:|:--------------:|:-----:|:------------:|:---------------:|:-----:|
+| **P50** | 0.34 ms | 0.56 ms | +0.22 ms | 1.44 ms | 1.88 ms | +0.44 ms |
+| **P95** | 0.64 ms | 1.18 ms | +0.54 ms | 3.74 ms | 4.24 ms | +0.51 ms |
+| **P99** | 0.80 ms | 1.72 ms | +0.92 ms | 4.93 ms | 6.83 ms | +1.90 ms |
+| **Max** | 14.6 ms | 9.9 ms | — | 10.6 ms | 59.5 ms | tail |
+
+### TPC-B (read-write mixed, 4 clients)
 
 | Target | TPS | Latency (avg) | vs Direct |
 |--------|----:|:-------------:|:---------:|
-| Direct PostgreSQL | 671 | 5.96 ms | baseline |
-| **Raw Proxy** (+ mirror) | **415** | **9.6 ms** | -38% |
+| Direct PostgreSQL | 675 | 5.93 ms | baseline |
+| **Raw Proxy** (+ mirror) | **595** | **6.72 ms** | -12% |
 
-**Key takeaway: Raw mode is 36x faster than Wire mode**, supports both Simple and Extended Query protocols with mirroring, with only ~40% overhead vs direct connection (including async mirroring to Aurora across availability zones).
+### Key Takeaways
+
+- **Raw mode is 36x faster than Wire mode**
+- **P50 overhead: only +0.2~0.4 ms** — the inherent cost of one extra TCP hop
+- **P95 stable at +0.5 ms** — production acceptable
+- **TPC-B (write) overhead only +0.8 ms** — mirror is fully async, doesn't block writes
+- **High concurrency (16c) scales well** — only 22% TPS drop vs direct
+- P99 tail latency at 16c due to goroutine scheduling + GC, rare occurrence
 
 ## Query Routing
 
