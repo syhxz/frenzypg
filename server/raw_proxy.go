@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -34,15 +37,21 @@ type RawProxyServer struct {
 	// Circuit breaker for mirror health
 	mirrorBreakers *MirrorCircuitBreakers
 
+	// Mirror reconnect manager
+	mirrorReconnectStop chan struct{}
+
 	// Metrics
 	metrics *Metrics
 
 	// TLS config for client-facing connections
 	clientTLSConfig *tls.Config
 
-	// Stats
-	activeConns atomic.Int64
-	totalConns  atomic.Int64
+	// Connection management
+	maxConnections int64 // 0 = unlimited
+	activeConns    atomic.Int64
+	totalConns     atomic.Int64
+	connWg         sync.WaitGroup // tracks active connections for graceful drain
+	idleTimeout    time.Duration  // close idle client connections after this duration
 
 	// Shutdown
 	listener net.Listener
@@ -51,8 +60,10 @@ type RawProxyServer struct {
 
 func NewRawProxyServer(logger *zap.Logger) *RawProxyServer {
 	s := &RawProxyServer{
-		logger:  logger,
-		metrics: NewMetrics("frenzy"),
+		logger:              logger,
+		metrics:             NewMetrics("frenzy"),
+		mirrorReconnectStop: make(chan struct{}),
+		idleTimeout:         30 * time.Minute, // default idle timeout
 	}
 	defaultFilter := &QueryFilterConfig{
 		SkipRollbackMirror: false,
@@ -69,6 +80,16 @@ func (s *RawProxyServer) SetPoolConfig(config *PoolConfig) {
 
 func (s *RawProxyServer) SetPerformanceConfig(config *PerformanceConfig) {
 	s.performanceConfig = config
+}
+
+func (s *RawProxyServer) SetMaxConnections(max int) {
+	s.maxConnections = int64(max)
+}
+
+func (s *RawProxyServer) SetIdleTimeout(d time.Duration) {
+	if d > 0 {
+		s.idleTimeout = d
+	}
 }
 
 func (s *RawProxyServer) SetQueryFilterConfig(config *QueryFilterConfig) {
@@ -122,7 +143,17 @@ func (s *RawProxyServer) ListenAndServe(
 	s.logger.Info("Raw proxy server started",
 		zap.String("listen", listenAddr),
 		zap.String("primary", maskAddress(primaryAddr)),
-		zap.Int("mirrors", len(mirrorAddrs)))
+		zap.Int("mirrors", len(mirrorAddrs)),
+		zap.Int64("max_connections", s.maxConnections),
+		zap.Duration("idle_timeout", s.idleTimeout))
+
+	// Start mirror reconnect goroutine
+	if len(s.mirrorPools) > 0 {
+		go s.mirrorReconnectLoop(ctx)
+	}
+
+	// Start SIGHUP config reload listener
+	go s.listenForReload()
 
 	// Accept loop
 	go func() {
@@ -135,6 +166,8 @@ func (s *RawProxyServer) ListenAndServe(
 		if err != nil {
 			select {
 			case <-ctx.Done():
+				// Wait for active connections to drain (with timeout)
+				s.drainConnections(10 * time.Second)
 				return nil
 			default:
 				s.logger.Error("Accept error", zap.Error(err))
@@ -142,8 +175,18 @@ func (s *RawProxyServer) ListenAndServe(
 			}
 		}
 
+		// Connection limit check
+		if s.maxConnections > 0 && s.activeConns.Load() >= s.maxConnections {
+			s.logger.Warn("Connection limit reached, rejecting",
+				zap.Int64("active", s.activeConns.Load()),
+				zap.Int64("max", s.maxConnections))
+			conn.Close()
+			continue
+		}
+
 		s.activeConns.Add(1)
 		s.totalConns.Add(1)
+		s.connWg.Add(1)
 		if s.metrics != nil {
 			s.metrics.ActiveConnections.Set(float64(s.activeConns.Load()))
 		}
@@ -152,19 +195,57 @@ func (s *RawProxyServer) ListenAndServe(
 }
 
 func (s *RawProxyServer) Close(ctx context.Context) error {
+	s.logger.Info("Starting graceful shutdown")
+
+	// 1. Stop accepting new connections
 	if s.cancel != nil {
 		s.cancel()
 	}
 	if s.listener != nil {
 		s.listener.Close()
 	}
+
+	// 2. Stop mirror reconnect
+	close(s.mirrorReconnectStop)
+
+	// 3. Wait for active connections to drain
+	s.drainConnections(15 * time.Second)
+
+	// 4. Close mirror pools
 	for _, pool := range s.mirrorPools {
 		if pool != nil {
 			pool.Close()
 		}
 	}
-	s.logger.Info("Raw proxy server shut down")
+
+	s.logger.Info("Raw proxy server shut down",
+		zap.Int64("total_connections_served", s.totalConns.Load()))
 	return nil
+}
+
+// drainConnections waits for all active connections to finish, with timeout.
+func (s *RawProxyServer) drainConnections(timeout time.Duration) {
+	if s.activeConns.Load() == 0 {
+		return
+	}
+
+	s.logger.Info("Waiting for active connections to drain",
+		zap.Int64("active", s.activeConns.Load()),
+		zap.Duration("timeout", timeout))
+
+	done := make(chan struct{})
+	go func() {
+		s.connWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		s.logger.Info("All connections drained")
+	case <-time.After(timeout):
+		s.logger.Warn("Drain timeout, forcing shutdown",
+			zap.Int64("remaining", s.activeConns.Load()))
+	}
 }
 
 // PingPrimary checks if the primary is reachable (for health check compatibility).
@@ -226,6 +307,7 @@ func (s *RawProxyServer) handleConnection(ctx context.Context, clientConn net.Co
 	defer func() {
 		clientConn.Close()
 		s.activeConns.Add(-1)
+		s.connWg.Done()
 		if s.metrics != nil {
 			s.metrics.ActiveConnections.Set(float64(s.activeConns.Load()))
 		}
@@ -418,14 +500,23 @@ func (s *RawProxyServer) proxyLoop(ctx context.Context, clientConn, backendConn 
 		default:
 		}
 
-		// Read one message from client
+		// Read one message from client (with idle timeout)
+		if s.idleTimeout > 0 {
+			clientConn.SetReadDeadline(time.Now().Add(s.idleTimeout))
+		}
 		msgType, msgData, err := readRawMessage(clientConn, clientBuf)
 		if err != nil {
 			if err != io.EOF {
-				s.logger.Debug("Client read error", zap.Error(err))
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					s.logger.Debug("Client idle timeout, closing connection")
+				} else {
+					s.logger.Debug("Client read error", zap.Error(err))
+				}
 			}
 			return
 		}
+		// Clear deadline after successful read
+		clientConn.SetReadDeadline(time.Time{})
 
 		// Handle terminate
 		if msgType == 'X' {
@@ -658,6 +749,103 @@ func (s *RawProxyServer) relayCopyOut(backendConn, clientConn net.Conn, buf []by
 			return nil
 		}
 		// 'd' = CopyData, keep relaying
+	}
+}
+
+// mirrorReconnectLoop periodically checks mirror pool health and reconnects if needed.
+func (s *RawProxyServer) mirrorReconnectLoop(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.checkMirrorHealth(ctx)
+		case <-s.mirrorReconnectStop:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *RawProxyServer) checkMirrorHealth(ctx context.Context) {
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	for i, pool := range s.mirrorPools {
+		if pool == nil {
+			continue
+		}
+		if err := pool.Ping(checkCtx); err != nil {
+			s.logger.Warn("Mirror ping failed",
+				zap.Int("mirror", i),
+				zap.Error(err))
+			// Attempt to recreate the pool
+			s.reconnectMirror(checkCtx, i)
+		}
+	}
+}
+
+func (s *RawProxyServer) reconnectMirror(ctx context.Context, index int) {
+	if index >= len(s.mirrorAddrs) {
+		return
+	}
+	addr := s.mirrorAddrs[index]
+
+	config, err := pgxpool.ParseConfig(addr)
+	if err != nil {
+		s.logger.Error("Mirror reconnect: parse config failed", zap.Int("mirror", index), zap.Error(err))
+		return
+	}
+
+	poolCfg := s.poolConfig
+	if poolCfg == nil {
+		poolCfg = DefaultPoolConfig()
+	}
+	config.MaxConns = poolCfg.MaxConns
+	config.MinConns = poolCfg.MinConns
+	config.MaxConnIdleTime = poolCfg.MaxConnIdleTime
+
+	newPool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		s.logger.Error("Mirror reconnect: create pool failed", zap.Int("mirror", index), zap.Error(err))
+		return
+	}
+
+	if err := newPool.Ping(ctx); err != nil {
+		newPool.Close()
+		s.logger.Error("Mirror reconnect: ping failed", zap.Int("mirror", index), zap.Error(err))
+		return
+	}
+
+	// Swap old pool with new one
+	oldPool := s.mirrorPools[index]
+	s.mirrorPools[index] = newPool
+	if oldPool != nil {
+		go func() {
+			time.Sleep(5 * time.Second)
+			oldPool.Close()
+		}()
+	}
+
+	s.logger.Info("Mirror reconnected successfully", zap.Int("mirror", index))
+}
+
+// listenForReload listens for SIGHUP to hot-reload filter configuration.
+func (s *RawProxyServer) listenForReload() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGHUP)
+
+	for {
+		select {
+		case <-sigCh:
+			s.logger.Info("Received SIGHUP, reloading filter config not implemented for raw mode (use config file restart)")
+			// Future: reload filter config from file
+		case <-s.mirrorReconnectStop:
+			signal.Stop(sigCh)
+			return
+		}
 	}
 }
 

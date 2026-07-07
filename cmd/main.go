@@ -312,6 +312,7 @@ func runWithCLI() {
 		rawSrv.SetPoolConfig(poolConfig)
 		rawSrv.SetPerformanceConfig(performanceConfig)
 		rawSrv.SetQueryFilterConfig(queryFilterConfig)
+		rawSrv.SetMaxConnections(int(poolConfig.MaxConns) * 10) // 10x pool size as client limit
 
 		go func() {
 			sig := <-sigCh
@@ -684,6 +685,7 @@ func runWithConfig(configPath string) {
 		rawSrv.SetPoolConfig(poolConfig)
 		rawSrv.SetPerformanceConfig(perfConfig)
 		rawSrv.SetQueryFilterConfig(filterConfig)
+		rawSrv.SetMaxConnections(int(poolConfig.MaxConns) * 10)
 
 		go func() {
 			sig := <-sigCh
