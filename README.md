@@ -13,9 +13,9 @@ A high-performance PostgreSQL wire protocol mirroring proxy. It sits between you
 
 ## Features
 
-- **Dual Proxy Mode** — Choose between `wire` (full protocol decode) and `raw` (high-performance byte forwarding)
+- **Dual Proxy Mode** — Choose between `raw` (high-performance byte forwarding, default) and `wire` (full protocol decode)
 - **Query Mirroring** — Mirror production traffic to shadow instances in real time
-- **Extended Query Protocol** — Full support for parameterized queries (`$1`, `$2`, ...) (wire mode)
+- **Extended Query Protocol** — Full support for parameterized queries (`$1`, `$2`, ...) in both modes
 - **Transaction Awareness** — Buffered transactions replayed atomically on mirrors at commit time
 - **SAVEPOINT Support** — Full support for SAVEPOINT, ROLLBACK TO, and RELEASE
 - **Stored Procedures** — CALL, DO, CREATE FUNCTION all properly mirrored
@@ -47,7 +47,7 @@ make build
 ### Run (CLI mode)
 
 ```bash
-# Wire mode (default) — full protocol decode, supports Extended Query Protocol
+# Wire mode — full protocol decode, supports transaction buffering
 ./bin/frenzy \
   --listen :5432 \
   --primary "postgresql://postgres:password@localhost:5433/mydb" \
