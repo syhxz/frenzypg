@@ -1,0 +1,222 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: frenzy
+---
+# ConfigMap: frenzy configuration file
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frenzy-config
+  namespace: frenzy
+data:
+  frenzy.yaml: |
+    listen: ":5432"
+
+    primary:
+      url: "postgresql://frenzy@${PG_PRIMARY_HOST}:5432/mydb?sslmode=require"
+      password_env: "FRENZY_PRIMARY_PASSWORD"
+
+    mirrors:
+      - url: "postgresql://frenzy@${PG_MIRROR_HOST}:5432/mydb?sslmode=require"
+        password_env: "FRENZY_MIRROR_PASSWORD"
+
+    pool:
+      max_conns: 20
+      min_conns: 5
+      max_conn_idle_time: 300
+
+    performance:
+      async_mirrors: true
+      mirror_timeout: 30
+      mirror_retries: 2
+      retry_delay: 3
+
+    filter:
+      mirror_all_queries: false
+      mirror_select_queries: false
+      skip_rollback_mirror: false
+      skip_mirror_tx_locks: false
+
+    service:
+      health_port: 8080
+---
+# Secret: database passwords
+apiVersion: v1
+kind: Secret
+metadata:
+  name: frenzy-secrets
+  namespace: frenzy
+type: Opaque
+stringData:
+  FRENZY_PRIMARY_PASSWORD: "change-me-primary"
+  FRENZY_MIRROR_PASSWORD: "change-me-mirror"
+---
+# Deployment: multi-replica stateless deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frenzy-proxy
+  namespace: frenzy
+  labels:
+    app: frenzy-proxy
+spec:
+  replicas: 3  # multi-replica HA
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1      # at most 1 unavailable during rolling update
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: frenzy-proxy
+  template:
+    metadata:
+      labels:
+        app: frenzy-proxy
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30  # allow time for buffer flush
+      containers:
+        - name: frenzy
+          image: your-registry/frenzypg:latest
+          args:
+            - "--config=/etc/frenzy/frenzy.yaml"
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: FRENZY_PRIMARY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: frenzy-secrets
+                  key: FRENZY_PRIMARY_PASSWORD
+            - name: FRENZY_MIRROR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: frenzy-secrets
+                  key: FRENZY_MIRROR_PASSWORD
+            - name: PG_PRIMARY_HOST
+              value: "primary-pg.database.svc.cluster.local"
+            - name: PG_MIRROR_HOST
+              value: "mirror-pg.database.svc.cluster.local"
+            - name: FRENZY_LOG_FORMAT
+              value: "json"
+            - name: FRENZY_LOG_LEVEL
+              value: "info"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          volumeMounts:
+            - name: config
+              mountPath: /etc/frenzy
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: frenzy-config
+---
+# Service: expose to applications
+apiVersion: v1
+kind: Service
+metadata:
+  name: frenzy-proxy
+  namespace: frenzy
+  labels:
+    app: frenzy-proxy
+spec:
+  type: ClusterIP
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+  selector:
+    app: frenzy-proxy
+---
+# PodDisruptionBudget: ensure at least 2 pods remain available
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frenzy-proxy-pdb
+  namespace: frenzy
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: frenzy-proxy
+---
+# HorizontalPodAutoscaler: auto-scale based on CPU
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frenzy-proxy-hpa
+  namespace: frenzy
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frenzy-proxy
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Pods
+      pods:
+        metric:
+          name: frenzy_active_connections  # custom metric
+        target:
+          type: AverageValue
+          averageValue: "50"
+---
+# ServiceMonitor (Prometheus Operator): auto-discover metrics endpoints
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: frenzy-proxy
+  namespace: frenzy
+  labels:
+    app: frenzy-proxy
+spec:
+  selector:
+    matchLabels:
+      app: frenzy-proxy
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics

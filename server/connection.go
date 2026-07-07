@@ -5,8 +5,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"os"
+	"net"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -59,64 +60,6 @@ func PutStringBuilder(sb *strings.Builder) {
 	}
 }
 
-type ConnectionType int
-
-const (
-	Primary ConnectionType = iota
-	Mirror
-)
-
-func connectionTypeName(ct ConnectionType) string {
-	switch ct {
-	case Primary:
-		return "primary"
-	case Mirror:
-		return "mirror"
-	default:
-		return "unknown"
-	}
-}
-
-// PoolConfig holds connection pool configuration
-type PoolConfig struct {
-	MaxConns        int32
-	MinConns        int32
-	MaxConnLifetime time.Duration
-	MaxConnIdleTime time.Duration
-}
-
-// PerformanceConfig holds performance optimization settings
-type PerformanceConfig struct {
-	WorkerThreads     int
-	QueryBufferSize   int
-	AsyncMirrors      bool
-	MirrorTimeoutSecs int // Timeout for mirror operations in seconds
-	MirrorRetries     int // Number of retries for failed mirror operations
-	RetryDelaySecs    int // Delay between retries in seconds
-}
-
-// DefaultPerformanceConfig returns default performance configuration
-func DefaultPerformanceConfig() *PerformanceConfig {
-	return &PerformanceConfig{
-		WorkerThreads:     0,   // Auto-detect based on CPU cores
-		QueryBufferSize:   8192, // 8KB buffer
-		AsyncMirrors:      true, // Enable async mirrors by default
-		MirrorTimeoutSecs: 120,  // 2 minutes timeout for mirrors
-		MirrorRetries:     2,    // Retry failed mirror operations twice
-		RetryDelaySecs:    5,    // 5 second delay between retries
-	}
-}
-
-// DefaultPoolConfig returns default connection pool configuration optimized for high concurrency
-func DefaultPoolConfig() *PoolConfig {
-	return &PoolConfig{
-		MaxConns:        10,  // Default, should be overridden by command line
-		MinConns:        2,   // Default, should be overridden by command line
-		MaxConnLifetime: 0,   // Never expire
-		MaxConnIdleTime: 300 * time.Second, // 5 minutes idle timeout
-	}
-}
-
 type Connection struct {
 	logger          *zap.Logger
 	name            string
@@ -131,12 +74,11 @@ type Connection struct {
 func NewConnection(logger *zap.Logger, connectionType ConnectionType, name string) *Connection {
 	var poolConfig *PoolConfig
 	if connectionType == Mirror {
-		// Use smaller pool for mirrors to prevent exhaustion
 		poolConfig = &PoolConfig{
-			MaxConns:        10, // Smaller pool for mirrors
-			MinConns:        2,
-			MaxConnLifetime: 3600,
-			MaxConnIdleTime: 300,
+			MaxConns:        20,
+			MinConns:        5,
+			MaxConnLifetime: 30 * time.Minute,
+			MaxConnIdleTime: 10 * time.Minute,
 		}
 	} else {
 		poolConfig = DefaultPoolConfig()
@@ -164,14 +106,14 @@ func (connection *Connection) Connect(
 	hostAddress string) error {
 
 	connection.host = hostAddress
-	connection.logger.Debug("Attempting to connect with connection pool", zap.String("address", hostAddress))
+	connection.logger.Debug("Attempting to connect with connection pool", zap.String("address", maskAddress(hostAddress)))
 	
 	// Parse connection string to check for SSL parameters and configure if needed
 	config, err := pgxpool.ParseConfig(connection.host)
 	if err != nil {
 		connection.logger.Error(
 			"failed to parse connection string",
-			zap.String("address", connection.host),
+			zap.String("address", maskAddress(connection.host)),
 			zap.Error(err))
 		return err
 	}
@@ -181,28 +123,42 @@ func (connection *Connection) Connect(
 	if err != nil {
 		connection.logger.Error(
 			"failed to configure SSL",
-			zap.String("address", connection.host),
+			zap.String("address", maskAddress(connection.host)),
 			zap.Error(err))
 		return err
 	}
 
-	// Configure connection pool parameters with sharing logic
-	// For mirrors, use half of the configured connections to share with primary
-	maxConns := connection.poolConfig.MaxConns
-	minConns := connection.poolConfig.MinConns
-	
-	if connection.connectionType == Mirror {
-		maxConns = maxConns / 2  // Mirror gets half
-		minConns = minConns / 2
-		if minConns < 1 {
-			minConns = 1  // Ensure at least 1 connection
+	// Configure connection pool parameters
+	config.MaxConns = connection.poolConfig.MaxConns
+	config.MinConns = connection.poolConfig.MinConns
+	config.MaxConnLifetime = connection.poolConfig.MaxConnLifetime
+	config.MaxConnIdleTime = connection.poolConfig.MaxConnIdleTime
+
+	// DNS pre-resolution: resolve hostname once and cache it to avoid
+	// DNS lookups on every new connection (saves ~5-10ms per connection)
+	if connection.connectionType == Mirror && config.ConnConfig.Host != "" {
+		resolvedAddr, resolveErr := net.DefaultResolver.LookupHost(ctx, config.ConnConfig.Host)
+		if resolveErr == nil && len(resolvedAddr) > 0 {
+			connection.logger.Info("DNS pre-resolved for mirror",
+				zap.String("host", config.ConnConfig.Host),
+				zap.String("resolved", resolvedAddr[0]))
+			config.ConnConfig.Host = resolvedAddr[0]
 		}
 	}
-	
-	config.MaxConns = maxConns
-	config.MinConns = minConns
-	config.MaxConnLifetime = connection.poolConfig.MaxConnLifetime  // Maximum connection lifetime
-	config.MaxConnIdleTime = connection.poolConfig.MaxConnIdleTime  // Maximum connection idle time
+
+	// For mirrors with TLS (RDS), configure session resumption to speed up reconnects
+	if connection.connectionType == Mirror && config.ConnConfig.TLSConfig != nil {
+		config.ConnConfig.TLSConfig.ClientSessionCache = tls.NewLRUClientSessionCache(32)
+	}
+
+	// Health check: verify connections are alive before handing to caller
+	// Only enable for remote mirrors where network issues are likely
+	if connection.connectionType == Mirror {
+		config.HealthCheckPeriod = 30 * time.Second
+	} else {
+		// For local primary, disable aggressive health checks to prevent unnecessary reconnections
+		config.HealthCheckPeriod = 5 * time.Minute
+	}
 
 	connection.logger.Info("Creating connection pool", 
 		zap.Int32("max_conns", config.MaxConns),
@@ -215,17 +171,20 @@ func (connection *Connection) Connect(
 	if err != nil {
 		connection.logger.Error(
 			"failed to create connection pool",
-			zap.String("address", connection.host),
+			zap.String("address", maskAddress(connection.host)),
 			zap.Error(err))
 		return err
 	}
+
+	// pgxpool internally creates MinConns connections in parallel via createIdleResources.
+	// No manual warmup needed — just wait for one connection to verify connectivity.
 
 	// Test connection pool
 	conn, err := connection.pool.Acquire(ctx)
 	if err != nil {
 		connection.logger.Error(
 			"failed to acquire connection from pool",
-			zap.String("address", connection.host),
+			zap.String("address", maskAddress(connection.host)),
 			zap.Error(err))
 		return err
 	}
@@ -246,7 +205,7 @@ func (connection *Connection) Connect(
 	if connection.connectionType == Primary {
 		connection.logger.Info(
 			"connected with connection pool",
-			zap.String("address", connection.host),
+			zap.String("address", maskAddress(connection.host)),
 			zap.Int32("max_conns", config.MaxConns),
 			zap.Int32("min_conns", config.MinConns))
 
@@ -265,7 +224,7 @@ func (connection *Connection) Connect(
 	} else if connection.connectionType == Mirror {
 		connection.logger.Info(
 			"Connected to mirror with connection pool",
-			zap.String("address", connection.host))
+			zap.String("address", maskAddress(connection.host)))
 	}
 	return nil
 }
@@ -768,7 +727,7 @@ func (connection *Connection) ExecuteSimpleCommand(ctx context.Context, query st
 func (connection *Connection) executeSimpleCommand(ctx context.Context, query string) error {
 	connection.logger.Debug("Executing simple command on primary", 
 		zap.String("query", query),
-		zap.String("address", connection.host))
+		zap.String("address", maskAddress(connection.host)))
 
 	// Acquire connection from pool
 	conn, err := connection.pool.Acquire(ctx)
@@ -783,7 +742,7 @@ func (connection *Connection) executeSimpleCommand(ctx context.Context, query st
 	if err != nil {
 		connection.logger.Error(
 			"Could not execute simple command on primary",
-			zap.String("address", connection.host),
+			zap.String("address", maskAddress(connection.host)),
 			zap.String("query", query),
 			zap.Error(err))
 		return err
@@ -803,7 +762,7 @@ func (connection *Connection) executePrimaryQuery(
 
 	connection.logger.Debug("Executing query on primary", 
 		zap.String("query", query),
-		zap.String("address", connection.host))
+		zap.String("address", maskAddress(connection.host)))
 
 	// Acquire connection from pool
 	conn, err := connection.pool.Acquire(ctx)
@@ -818,7 +777,7 @@ func (connection *Connection) executePrimaryQuery(
 	if err != nil {
 		connection.logger.Error(
 			"Could not execute query on primary",
-			zap.String("address", connection.host),
+			zap.String("address", maskAddress(connection.host)),
 			zap.String("query", query),
 			zap.Error(err))
 		return err
@@ -941,7 +900,7 @@ func (connection *Connection) executeMirrorQuery(
 
 	connection.logger.Debug("Executing query on mirror", 
 		zap.String("query", query),
-		zap.String("address", connection.host))
+		zap.String("address", maskAddress(connection.host)))
 
 	// Acquire connection from pool
 	conn, err := connection.pool.Acquire(ctx)
@@ -951,26 +910,18 @@ func (connection *Connection) executeMirrorQuery(
 	}
 	defer conn.Release()
 
-	rows, err := conn.Query(context.Background(), query)
+	_, err = conn.Exec(ctx, query)
 	if err != nil {
 		connection.logger.Error(
 			"Could not execute query on mirror",
-			zap.String("address", connection.host),
+			zap.String("address", maskAddress(connection.host)),
 			zap.String("query", query),
 			zap.Error(err))
 
 		return err
 	}
-	defer rows.Close()
-	
-	// Count rows for logging
-	rowCount := 0
-	for rows.Next() {
-		rowCount++
-	}
 	
 	connection.logger.Debug("Mirror query completed", 
-		zap.Int("rows_processed", rowCount),
 		zap.String("query", query))
 	
 	return nil

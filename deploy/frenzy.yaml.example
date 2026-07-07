@@ -1,0 +1,59 @@
+# FrenzyPG configuration file example
+# Place this file at /etc/frenzy/frenzy.yaml or specify via --config
+
+listen: ":5432"
+
+# Proxy mode: "wire" or "raw"
+#   raw  - Raw protocol byte forwarding (default, high performance, supports both Simple & Extended Query)
+#   wire - Full protocol decode via psql-wire (supports transaction buffering, commit-time replay)
+mode: "raw"
+
+primary:
+  url: "postgresql://postgres@localhost:5433/dbname"
+  # Password is injected from environment variable. Format: ${ENV_VAR_NAME}
+  # Or use env var directly in url: postgresql://user:${DB_PASSWORD}@host/db
+  password_env: "FRENZY_PRIMARY_PASSWORD"
+
+mirrors:
+  - url: "postgresql://dbmgr@mirror-host:5432/dbname"
+    password_env: "FRENZY_MIRROR_PASSWORD"
+
+# TLS configuration (optional)
+tls:
+  enabled: false
+  cert_file: ""
+  key_file: ""
+  ca_file: ""
+  server_name: ""
+  skip_verify: false
+
+# Connection pool
+pool:
+  max_conns: 10
+  min_conns: 2
+  max_conn_lifetime: 0     # seconds, 0=never expire
+  max_conn_idle_time: 300  # seconds
+
+# Performance
+performance:
+  worker_threads: 0        # 0=auto-detect
+  query_buffer_size: 8192
+  async_mirrors: true
+  mirror_timeout: 120      # seconds
+  mirror_retries: 2
+  retry_delay: 5           # seconds
+
+# Query filtering
+filter:
+  mirror_all_queries: false
+  mirror_select_queries: false
+  mirror_ddl_only: false
+  mirror_dml_only: false
+  skip_rollback_mirror: false
+  skip_failed_tx_mirror: true
+  skip_mirror_tx_locks: false
+
+# Service management
+service:
+  pid_file: "/var/run/frenzy/frenzy.pid"
+  health_port: 9090

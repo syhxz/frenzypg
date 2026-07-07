@@ -1,0 +1,25 @@
+# Build artifacts
+bin/
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# Logs
+*.log
+
+# PID files
+*.pid
+
+# Test config files (may contain credentials)
+test_*.yaml

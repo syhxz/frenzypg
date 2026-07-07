@@ -1,12 +1,10 @@
 package server
 
 import (
-	"context"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
 
@@ -21,13 +19,11 @@ const (
 
 // Session represents a client session with transaction state
 type Session struct {
-	ID              string
+	ID               string
 	TransactionState TransactionState
-	PrimaryConn     *pgxpool.Conn
-	MirrorConns     []*pgxpool.Conn
-	LastUsed        time.Time
-	mutex           sync.RWMutex
-	logger          *zap.Logger
+	LastUsed         time.Time
+	mutex            sync.RWMutex
+	logger           *zap.Logger
 }
 
 // SessionManager manages client sessions and their transaction states
@@ -92,8 +88,18 @@ func IsTransactionCommand(query string) (bool, string) {
 	if strings.HasPrefix(trimmed, "COMMIT") || trimmed == "END" {
 		return true, "COMMIT"
 	}
+	if strings.HasPrefix(trimmed, "ROLLBACK TO SAVEPOINT") || strings.HasPrefix(trimmed, "ROLLBACK TO ") {
+		// ROLLBACK TO SAVEPOINT does NOT end the transaction — it's a savepoint operation
+		return true, "ROLLBACK_TO_SAVEPOINT"
+	}
 	if strings.HasPrefix(trimmed, "ROLLBACK") {
 		return true, "ROLLBACK"
+	}
+	if strings.HasPrefix(trimmed, "SAVEPOINT ") {
+		return true, "SAVEPOINT"
+	}
+	if strings.HasPrefix(trimmed, "RELEASE SAVEPOINT") || strings.HasPrefix(trimmed, "RELEASE ") {
+		return true, "RELEASE_SAVEPOINT"
 	}
 	
 	return false, ""
@@ -124,50 +130,10 @@ func (s *Session) IsInTransaction() bool {
 	return s.TransactionState == TransactionInProgress
 }
 
-// SetPrimaryConnection sets the dedicated primary connection for this session
-func (s *Session) SetPrimaryConnection(conn *pgxpool.Conn) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.PrimaryConn = conn
-}
-
-// SetMirrorConnections sets the dedicated mirror connections for this session
-func (s *Session) SetMirrorConnections(conns []*pgxpool.Conn) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.MirrorConns = conns
-}
-
-// Cleanup releases all connections associated with this session
+// Cleanup resets session state
 func (s *Session) Cleanup() {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-
-	if s.PrimaryConn != nil {
-		// If in transaction, rollback before releasing
-		if s.TransactionState == TransactionInProgress {
-			s.logger.Warn("Rolling back uncommitted transaction on session cleanup", zap.String("session", s.ID))
-			_, err := s.PrimaryConn.Exec(context.Background(), "ROLLBACK")
-			if err != nil {
-				s.logger.Error("Failed to rollback transaction during cleanup", zap.Error(err))
-			}
-		}
-		s.PrimaryConn.Release()
-		s.PrimaryConn = nil
-	}
-
-	for _, mirrorConn := range s.MirrorConns {
-		if mirrorConn != nil {
-			if s.TransactionState == TransactionInProgress {
-				_, err := mirrorConn.Exec(context.Background(), "ROLLBACK")
-				if err != nil {
-					s.logger.Error("Failed to rollback mirror transaction during cleanup", zap.Error(err))
-				}
-			}
-			mirrorConn.Release()
-		}
-	}
-	s.MirrorConns = nil
 	s.TransactionState = TransactionIdle
 }
 

@@ -58,9 +58,12 @@ func (stt *SimpleTransactionTracker) UpdateConnectionState(conn *pgxpool.Conn, q
 	} else if strings.HasPrefix(trimmed, "COMMIT") {
 		delete(stt.connectionStates, key)
 		stt.logger.Debug("Transaction committed on connection", zap.String("key", key))
-	} else if strings.HasPrefix(trimmed, "ROLLBACK") {
+	} else if strings.HasPrefix(trimmed, "ROLLBACK") && !strings.Contains(trimmed, "TO SAVEPOINT") && !strings.Contains(trimmed, "TO ") {
 		delete(stt.connectionStates, key)
 		stt.logger.Debug("Transaction rolled back on connection", zap.String("key", key))
+	} else if stt.connectionStates[key].state == TransactionInProgress {
+		// Update lastUsed for any query within an active transaction
+		stt.connectionStates[key] = trackedConn{state: TransactionInProgress, lastUsed: time.Now()}
 	}
 }
 
@@ -69,7 +72,14 @@ func (stt *SimpleTransactionTracker) IsInTransaction(conn *pgxpool.Conn) bool {
 	defer stt.mutex.RUnlock()
 
 	tc, exists := stt.connectionStates[connKey(conn)]
-	return exists && tc.state == TransactionInProgress
+	if !exists {
+		return false
+	}
+	// Guard against PID reuse: if state is stale (>2 minutes without activity), ignore it
+	if time.Since(tc.lastUsed) > 2*time.Minute {
+		return false
+	}
+	return tc.state == TransactionInProgress
 }
 
 func (stt *SimpleTransactionTracker) CleanupConnection(conn *pgxpool.Conn) {

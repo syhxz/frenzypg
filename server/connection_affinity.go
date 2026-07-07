@@ -10,16 +10,17 @@ import (
 	"go.uber.org/zap"
 )
 
-// ConnectionAffinity manages dedicated connections for transactions
+// ConnectionAffinity manages dedicated connections for sessions that are in active transactions.
+// Non-transactional queries acquire and immediately release connections from the pool.
 type ConnectionAffinity struct {
 	pool               *pgxpool.Pool
 	sessionConnections map[string]*pgxpool.Conn
 	sessionStates      map[string]TransactionState
 	sessionLastUsed    map[string]time.Time
-	mutex              sync.RWMutex
+	mutex              sync.Mutex // Use a single mutex (not RW) to prevent read-during-write races
 	logger             *zap.Logger
 	cleanupTicker      *time.Ticker
-	stopCleanup        chan bool
+	stopCleanup        chan struct{}
 }
 
 func NewConnectionAffinity(pool *pgxpool.Pool, logger *zap.Logger) *ConnectionAffinity {
@@ -29,29 +30,26 @@ func NewConnectionAffinity(pool *pgxpool.Pool, logger *zap.Logger) *ConnectionAf
 		sessionStates:      make(map[string]TransactionState),
 		sessionLastUsed:    make(map[string]time.Time),
 		logger:             logger,
-		cleanupTicker:      time.NewTicker(30 * time.Second),
-		stopCleanup:        make(chan bool),
+		cleanupTicker:      time.NewTicker(5 * time.Second),
+		stopCleanup:        make(chan struct{}),
 	}
 
-	// Start cleanup goroutine
 	go ca.cleanupIdleSessions()
-	
+
 	return ca
 }
 
+// GetConnection returns a pinned connection for in-transaction sessions,
+// or acquires a fresh one for non-transactional queries.
+// For non-transactional queries, caller MUST call ReleaseIfIdle after use.
 func (ca *ConnectionAffinity) GetConnection(ctx context.Context, sessionID string) (*pgxpool.Conn, error) {
 	ca.mutex.Lock()
 	defer ca.mutex.Unlock()
 
-	// Clean up stale connections first
-	ca.cleanupStaleConnections()
-
-	// Update last used time
 	ca.sessionLastUsed[sessionID] = time.Now()
 
-	// If we have an existing connection for this session, return it
+	// If session already has a pinned connection (in transaction), reuse it
 	if conn, exists := ca.sessionConnections[sessionID]; exists {
-		ca.logger.Debug("Reusing existing connection for session", zap.String("session", sessionID))
 		return conn, nil
 	}
 
@@ -61,30 +59,81 @@ func (ca *ConnectionAffinity) GetConnection(ctx context.Context, sessionID strin
 		return nil, fmt.Errorf("failed to acquire connection: %w", err)
 	}
 
+	// Pin connection for this session
 	ca.sessionConnections[sessionID] = conn
-	ca.sessionStates[sessionID] = TransactionIdle
-	ca.logger.Debug("Created new connection for session", zap.String("session", sessionID))
-	
+	if _, hasState := ca.sessionStates[sessionID]; !hasState {
+		ca.sessionStates[sessionID] = TransactionIdle
+	}
+
 	return conn, nil
 }
 
-// cleanupStaleConnections releases connections that haven't been used recently
-func (ca *ConnectionAffinity) cleanupStaleConnections() {
-	now := time.Now()
-	for sessionID, lastUsed := range ca.sessionLastUsed {
-		// Release connections idle for more than 5 minutes
-		if now.Sub(lastUsed) > 5*time.Minute {
-			if conn, exists := ca.sessionConnections[sessionID]; exists {
-				conn.Release()
-				delete(ca.sessionConnections, sessionID)
-				delete(ca.sessionStates, sessionID)
-				delete(ca.sessionLastUsed, sessionID)
-				ca.logger.Debug("Released stale connection", zap.String("session", sessionID))
-			}
-		}
+// ReleaseIfIdle releases the connection if the session is NOT in an active transaction.
+// Instead of releasing immediately, we keep the connection pinned for a short grace period
+// to avoid the expensive acquire/release cycle on every transaction boundary.
+// The cleanup goroutine will release truly idle sessions.
+func (ca *ConnectionAffinity) ReleaseIfIdle(sessionID string) {
+	ca.mutex.Lock()
+	defer ca.mutex.Unlock()
+
+	state := ca.sessionStates[sessionID]
+	if state == TransactionInProgress {
+		// Keep connection pinned during transaction
+		return
+	}
+
+	// DON'T release immediately — keep pinned for session reuse.
+	// The next BEGIN from the same session will reuse this connection
+	// without a pool Acquire. The cleanup goroutine handles truly idle ones.
+	ca.sessionLastUsed[sessionID] = time.Now()
+}
+
+// ReleaseConnection immediately releases the connection for a session back to the pool.
+// Used when a transaction ends (COMMIT/ROLLBACK) to avoid holding connections unnecessarily.
+func (ca *ConnectionAffinity) ReleaseConnection(sessionID string) {
+	ca.mutex.Lock()
+	defer ca.mutex.Unlock()
+
+	if conn, exists := ca.sessionConnections[sessionID]; exists {
+		conn.Release()
+		delete(ca.sessionConnections, sessionID)
+		delete(ca.sessionStates, sessionID)
+		delete(ca.sessionLastUsed, sessionID)
 	}
 }
 
+// UpdateAndCheckRelease atomically updates transaction state and returns true if
+// the session should be released (not in transaction after the update).
+func (ca *ConnectionAffinity) UpdateAndCheckRelease(sessionID string, query string) bool {
+	ca.mutex.Lock()
+	defer ca.mutex.Unlock()
+
+	_, cmdType := IsTransactionCommand(query)
+	if cmdType == "" {
+		// Not a transaction command — check current state
+		state := ca.sessionStates[sessionID]
+		return state != TransactionInProgress
+	}
+
+	switch cmdType {
+	case "BEGIN":
+		ca.sessionStates[sessionID] = TransactionInProgress
+		ca.logger.Debug("Transaction started", zap.String("session", sessionID))
+		return false // Don't release — transaction just started
+	case "COMMIT", "ROLLBACK":
+		ca.sessionStates[sessionID] = TransactionIdle
+		ca.sessionLastUsed[sessionID] = time.Now()
+		ca.logger.Debug("Transaction ended", zap.String("session", sessionID), zap.String("command", cmdType))
+		return true // Release — transaction ended
+	case "SAVEPOINT", "RELEASE_SAVEPOINT", "ROLLBACK_TO_SAVEPOINT":
+		ca.logger.Debug("Savepoint operation", zap.String("session", sessionID), zap.String("command", cmdType))
+		return false // Don't release — still in transaction
+	}
+
+	return ca.sessionStates[sessionID] != TransactionInProgress
+}
+
+// UpdateTransactionState updates state based on the query that was just executed.
 func (ca *ConnectionAffinity) UpdateTransactionState(sessionID string, query string) {
 	ca.mutex.Lock()
 	defer ca.mutex.Unlock()
@@ -100,17 +149,21 @@ func (ca *ConnectionAffinity) UpdateTransactionState(sessionID string, query str
 		ca.logger.Debug("Transaction started", zap.String("session", sessionID))
 	case "COMMIT", "ROLLBACK":
 		ca.sessionStates[sessionID] = TransactionIdle
-		ca.logger.Debug("Transaction ended", zap.String("session", sessionID), zap.String("command", cmdType))
-		
-		// Keep connection alive for session - don't release after transaction ends
 		ca.sessionLastUsed[sessionID] = time.Now()
+		ca.logger.Debug("Transaction ended", zap.String("session", sessionID), zap.String("command", cmdType))
+		// Keep connection pinned for session reuse — don't release here.
+		// The cleanup goroutine will handle truly idle sessions.
+	case "SAVEPOINT", "RELEASE_SAVEPOINT", "ROLLBACK_TO_SAVEPOINT":
+		// Savepoint operations do NOT change the overall transaction state.
+		// Connection stays pinned; transaction remains in progress.
+		ca.logger.Debug("Savepoint operation", zap.String("session", sessionID), zap.String("command", cmdType))
 	}
 }
 
 func (ca *ConnectionAffinity) IsInTransaction(sessionID string) bool {
-	ca.mutex.RLock()
-	defer ca.mutex.RUnlock()
-	
+	ca.mutex.Lock()
+	defer ca.mutex.Unlock()
+
 	state, exists := ca.sessionStates[sessionID]
 	return exists && state == TransactionInProgress
 }
@@ -131,25 +184,45 @@ func (ca *ConnectionAffinity) cleanupExpiredSessions() {
 	defer ca.mutex.Unlock()
 
 	now := time.Now()
-	expiredSessions := make([]string, 0)
+	var expiredSessions []string
+
+	// Release connections that have been idle (no active transaction) for > 10 seconds
+	// This is fast enough to reclaim resources but avoids churn during active workloads
+	idleTimeout := 10 * time.Second
+	orphanTimeout := 10 * time.Minute
 
 	for sessionID, lastUsed := range ca.sessionLastUsed {
-		// Clean up sessions idle for more than 5 minutes and not in transaction
-		if now.Sub(lastUsed) > 5*time.Minute {
-			if state, exists := ca.sessionStates[sessionID]; !exists || state != TransactionInProgress {
-				expiredSessions = append(expiredSessions, sessionID)
-			}
+		state := ca.sessionStates[sessionID]
+		idle := now.Sub(lastUsed)
+
+		if state != TransactionInProgress && idle > idleTimeout {
+			expiredSessions = append(expiredSessions, sessionID)
+		} else if state == TransactionInProgress && idle > orphanTimeout {
+			// Force-expire very old transactions (likely orphaned)
+			ca.logger.Warn("Force-expiring orphaned transaction session",
+				zap.String("session", sessionID),
+				zap.Duration("idle", idle))
+			expiredSessions = append(expiredSessions, sessionID)
 		}
 	}
 
 	for _, sessionID := range expiredSessions {
 		if conn, exists := ca.sessionConnections[sessionID]; exists {
-			ca.logger.Debug("Cleaning up expired session", zap.String("session", sessionID))
+			// Rollback any in-progress transaction before releasing
+			if ca.sessionStates[sessionID] == TransactionInProgress {
+				_, _ = conn.Exec(context.Background(), "ROLLBACK")
+			}
 			conn.Release()
 			delete(ca.sessionConnections, sessionID)
 			delete(ca.sessionStates, sessionID)
 			delete(ca.sessionLastUsed, sessionID)
 		}
+	}
+
+	if len(expiredSessions) > 0 {
+		ca.logger.Info("Cleaned up expired affinity sessions",
+			zap.Int("cleaned", len(expiredSessions)),
+			zap.Int("remaining", len(ca.sessionConnections)))
 	}
 }
 
@@ -157,24 +230,18 @@ func (ca *ConnectionAffinity) Close() {
 	ca.mutex.Lock()
 	defer ca.mutex.Unlock()
 
-	// Stop cleanup goroutine
 	close(ca.stopCleanup)
 	ca.cleanupTicker.Stop()
 
-	// Release all connections
+	// Release all connections, rolling back active transactions
 	for sessionID, conn := range ca.sessionConnections {
-		// Rollback any active transactions
-		if state, exists := ca.sessionStates[sessionID]; exists && state == TransactionInProgress {
+		if ca.sessionStates[sessionID] == TransactionInProgress {
 			ca.logger.Warn("Rolling back active transaction on close", zap.String("session", sessionID))
-			_, err := conn.Exec(context.Background(), "ROLLBACK")
-			if err != nil {
-				ca.logger.Error("Failed to rollback transaction on close", zap.Error(err))
-			}
+			_, _ = conn.Exec(context.Background(), "ROLLBACK")
 		}
 		conn.Release()
 	}
 
-	// Clear maps
 	ca.sessionConnections = make(map[string]*pgxpool.Conn)
 	ca.sessionStates = make(map[string]TransactionState)
 	ca.sessionLastUsed = make(map[string]time.Time)

@@ -1,0 +1,58 @@
+[Unit]
+Description=Frenzy PostgreSQL Mirroring Proxy
+Documentation=https://github.com/syhxz/frenzypg
+After=network.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=frenzy
+Group=frenzy
+
+# Start using config file (recommended)
+ExecStart=/usr/local/bin/frenzy --config /etc/frenzy/frenzy.yaml
+
+# Database passwords are injected via environment variables.
+# Option 1: Set directly in this file (not recommended for production)
+# Environment=FRENZY_PRIMARY_PASSWORD=changeme
+# Environment=FRENZY_MIRROR_PASSWORD=changeme
+
+# Option 2: Load from a separate credentials file (recommended, chmod 600)
+EnvironmentFile=-/etc/frenzy/credentials
+
+# Logging
+Environment=FRENZY_LOG_LEVEL=info
+Environment=FRENZY_LOG_FORMAT=json
+Environment=FRENZY_LOG_FILE=/var/log/frenzy/frenzy.log
+
+# Log rotation (built-in, via lumberjack)
+Environment=FRENZY_LOG_MAX_SIZE=100
+Environment=FRENZY_LOG_MAX_BACKUPS=7
+Environment=FRENZY_LOG_MAX_AGE=30
+Environment=FRENZY_LOG_COMPRESS=true
+
+# Process management
+PIDFile=/var/run/frenzy/frenzy.pid
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitInterval=60
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/frenzy /var/run/frenzy
+PrivateTmp=true
+
+# Graceful shutdown
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
