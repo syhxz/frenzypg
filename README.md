@@ -15,6 +15,7 @@ A high-performance PostgreSQL wire protocol mirroring proxy. It sits between you
 
 - **Dual Proxy Mode** — Choose between `raw` (high-performance byte forwarding, default) and `wire` (full protocol decode)
 - **Query Mirroring** — Mirror production traffic to shadow instances in real time
+- **Kafka Durable Queue** — Asynchronous mirror delivery via Kafka, guaranteeing zero data loss even during mirror outages
 - **Extended Query Protocol** — Full support for parameterized queries (`$1`, `$2`, ...) in both modes
 - **Transaction Awareness** — Buffered transactions replayed atomically on mirrors at commit time
 - **SAVEPOINT Support** — Full support for SAVEPOINT, ROLLBACK TO, and RELEASE
@@ -33,7 +34,7 @@ A high-performance PostgreSQL wire protocol mirroring proxy. It sits between you
 - **Config Hot-Reload** — SIGHUP-triggered reload without restart
 - **Log Rotation** — Built-in file rotation (max size, max age, compression)
 - **Health Check** — HTTP `/health` endpoint with primary connectivity verification
-- **Graceful Shutdown** — Buffer flush + clean connection draining on SIGTERM/SIGINT
+- **Graceful Shutdown** — Kafka queue drain + clean connection draining on SIGTERM/SIGINT
 - **Kubernetes Ready** — Stateless, multi-replica, with HPA and PDB support
 
 ## Quick Start
@@ -116,6 +117,22 @@ filter:
   mirror_dml_only: false
   skip_rollback_mirror: false
   skip_mirror_tx_locks: false
+
+# Kafka durable queue (optional, recommended for production)
+kafka:
+  brokers: ["kafka1:9092", "kafka2:9092", "kafka3:9092"]
+  topic: "frenzy-mirror"
+  partitions: 6
+  workers: 8                # parallel consumer workers
+  group_id: "frenzy-mirror"
+  local_buffer_size: 100000 # in-memory buffer before Kafka write
+  # SASL authentication (optional)
+  # sasl_mechanism: "scram-sha-256"
+  # sasl_username: "frenzy"
+  # sasl_password_env: "FRENZY_KAFKA_PASSWORD"
+  # TLS (optional)
+  # tls_enabled: true
+  # tls_ca_file: "/etc/ssl/kafka-ca.pem"
 
 service:
   pid_file: "/var/run/frenzy/frenzy.pid"
@@ -205,8 +222,9 @@ Client ←→ [Header Parse] ←→ Route Decision ←→ [Raw Byte Forward] ←
 |---------|:---------:|:--------:|
 | SimpleQuery protocol | ✅ | ✅ |
 | Extended Query (prepared statements) | ✅ | ✅ |
-| Extended Query mirroring | ✅ | ✅ (Parse SQL extraction) |
-| Transaction buffering | ✅ (commit-time replay) | ❌ (async per-statement) |
+| Extended Query mirroring | ✅ | ✅ (parameter inlining) |
+| Transaction buffering | ✅ (commit-time replay) | ✅ (commit-time replay) |
+| Kafka durable queue | ❌ | ✅ |
 | Query filtering & mirror | ✅ | ✅ |
 | Column type detection | ✅ | ❌ (transparent) |
 | COPY FROM STDIN | ✅ | ✅ (pass-through) |
@@ -389,42 +407,100 @@ FrenzyPG is stateless — transaction buffers are ephemeral and only affect mirr
 Client App
     │
     ▼ (PostgreSQL wire protocol)
-┌──────────────────────────────────────────────────┐
-│                FrenzyPG Proxy                     │
-│                                                  │
-│  ┌─────────────────────────────────────────────┐ │
-│  │            Mode Selection                    │ │
-│  │   --mode wire          --mode raw            │ │
-│  └──────┬────────────────────────┬─────────────┘ │
-│         │                        │               │
-│  ┌──────▼──────────┐    ┌───────▼────────────┐  │
-│  │   Wire Mode     │    │    Raw Mode        │  │
-│  │  (psql-wire)    │    │  (pgproto3 byte)   │  │
-│  │                 │    │                    │  │
-│  │ • Full decode   │    │ • 5-byte header    │  │
-│  │ • Extended QP   │    │ • Zero-copy fwd    │  │
-│  │ • Tx buffering  │    │ • writev syscall   │  │
-│  │ • Column detect │    │ • Simple+Extended │  │
-│  └──────┬──────────┘    └───────┬────────────┘  │
-│         │                       │                │
-│  ┌──────▼───────────────────────▼─────────────┐  │
-│  │          Mirror Dispatch                    │  │
-│  │  • Query filtering (DDL/DML/SELECT/ALL)     │  │
-│  │  • Async goroutine execution                │  │
-│  │  • Circuit breaker (per mirror)             │  │
-│  │  • Retry with backoff                       │  │
-│  └──────┬───────────────────────┬─────────────┘  │
-│         │                       │                │
-│  ┌──────▼────┐          ┌──────▼──────────┐     │
-│  │  Primary  │          │  Mirror Pool(s) │     │
-│  │  (pool)   │          │  (pgxpool)      │     │
-│  └──────┬────┘          └──────┬──────────┘     │
-└─────────┼──────────────────────┼─────────────────┘
-          │                      │
-          ▼                      ▼
-    PostgreSQL              PostgreSQL / Aurora
-     (primary)              (mirror)
+┌──────────────────────────────────────────────────────────────────────┐
+│                          FrenzyPG Proxy                               │
+│                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │              Mode Selection                                      │ │
+│  │     --mode wire              --mode raw (default)                │ │
+│  └────────┬───────────────────────────────┬────────────────────────┘ │
+│           │                               │                          │
+│  ┌────────▼────────────┐    ┌─────────────▼──────────────────────┐   │
+│  │     Wire Mode       │    │         Raw Mode                   │   │
+│  │   (psql-wire)       │    │  (5-byte header + zero-copy fwd)   │   │
+│  └────────┬────────────┘    └─────────────┬──────────────────────┘   │
+│           │                               │                          │
+│  ┌────────▼───────────────────────────────▼────────────────────────┐ │
+│  │              Mirror Dispatch Layer                                │ │
+│  │  • Query filtering (DDL/DML/SELECT/ALL)                          │ │
+│  │  • Transaction buffering (commit-time replay)                    │ │
+│  │  • Circuit breaker (per mirror)                                  │ │
+│  └────────┬──────────────────────────────────────┬─────────────────┘ │
+│           │                                      │                   │
+│  ┌────────▼────┐                    ┌────────────▼───────────────┐   │
+│  │  Primary    │                    │  Kafka Durable Queue       │   │
+│  │  (pgxpool)  │                    │                            │   │
+│  └────────┬────┘                    │  Producer → Topic (6 part) │   │
+│           │                         │       │                    │   │
+│           │                         │  1 Reader → N Workers      │   │
+│           │                         │       │                    │   │
+│           │                         │  ┌────▼──────────────┐     │   │
+│           │                         │  │  Mirror Pool(s)   │     │   │
+│           │                         │  │  (pgxpool)        │     │   │
+│           │                         │  └────┬──────────────┘     │   │
+│           │                         └───────┼────────────────────┘   │
+└───────────┼─────────────────────────────────┼────────────────────────┘
+            │                                 │
+            ▼                                 ▼
+      PostgreSQL                     PostgreSQL / Aurora
+       (primary)                       (mirror)
 ```
+
+## Kafka Durable Queue
+
+When `kafka` is configured, FrenzyPG uses Kafka as a durable delivery queue between the proxy and mirror databases. This decouples primary write latency from mirror performance and guarantees zero data loss.
+
+### How It Works
+
+```
+Primary Write Path (non-blocking):
+  Client → Proxy → Primary PostgreSQL (synchronous)
+                 ↘ Local Buffer (100K msgs) → Kafka Producer (batch flush)
+
+Mirror Replay Path (async, parallel):
+  Kafka Topic → 1 Reader (FetchMessage) → Dispatch Channel → N Workers → Mirror DB
+                                                              (parallel Exec)
+```
+
+1. **Enqueue is non-blocking** — SQL statements are serialized to a local in-memory channel (nanoseconds). Primary latency is never affected by mirror speed.
+2. **Producer batches** — A background goroutine drains the local buffer and batch-writes to Kafka (10ms flush interval, up to 1000 messages per batch).
+3. **Consumer parallelism** — A single reader goroutine fetches from Kafka and dispatches to N worker goroutines that execute against the mirror pool in parallel.
+4. **At-least-once delivery** — Uses `FetchMessage` + explicit `CommitMessages` after execution. If a worker crashes mid-execution, the message will be redelivered.
+5. **Graceful shutdown** — On SIGTERM, the producer flushes all remaining local buffer to Kafka, then consumers drain remaining messages before exit.
+
+### Configuration
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `brokers` | (required) | Kafka broker addresses |
+| `topic` | `frenzy-mirror` | Kafka topic name (auto-created if permissions allow) |
+| `partitions` | `6` | Number of topic partitions (more = higher throughput) |
+| `workers` | `4` | Parallel consumer workers executing on mirror |
+| `group_id` | `frenzy-mirror` | Consumer group ID |
+| `local_buffer_size` | `100000` | In-memory buffer size before Kafka write |
+| `sasl_mechanism` | | SASL auth: `plain`, `scram-sha-256`, `scram-sha-512` |
+| `sasl_username` | | SASL username |
+| `sasl_password` | | SASL password (prefer `sasl_password_env`) |
+| `sasl_password_env` | | Environment variable containing SASL password |
+| `tls_enabled` | `false` | Enable TLS to Kafka brokers |
+| `tls_skip_verify` | `false` | Skip TLS certificate verification |
+| `tls_ca_file` | | CA certificate file for Kafka TLS |
+| `tls_cert_file` | | Client certificate for mTLS |
+| `tls_key_file` | | Client key for mTLS |
+
+### Without Kafka (Direct Mode)
+
+If `kafka` is not configured, mirror queries are dispatched directly via goroutines — fire-and-forget with retry. This is simpler but provides no durability guarantee if the proxy crashes.
+
+### Tuning Recommendations
+
+| Scenario | Workers | Partitions | Buffer Size |
+|----------|:-------:|:----------:|:-----------:|
+| Dev/test (single mirror, low latency) | 4 | 6 | 10000 |
+| Production (cross-AZ Aurora, ~2ms RTT) | 8-16 | 6-12 | 100000 |
+| High-throughput (>1000 TPS primary) | 16-32 | 12-24 | 200000 |
+
+**Key insight:** Mirror replay speed is bounded by the mirror database's write capacity, not by Kafka or the number of workers. If your mirror is a small Aurora instance (~220 TPS), increasing workers beyond 8 won't help. Scale the mirror instance instead.
 
 ## Project Structure
 
@@ -436,6 +512,7 @@ frenzypg/
 ├── server/
 │   ├── proxy.go               # Core proxy struct, wire protocol parsing
 │   ├── raw_proxy.go           # Raw byte-forwarding proxy (high-performance mode)
+│   ├── mirror_queue.go        # Kafka durable queue (producer + consumer dispatch)
 │   ├── query_executor.go      # Primary execution, result streaming
 │   ├── mirror.go              # Mirror dispatch, filtering, tx buffering
 │   ├── copy_handler.go        # COPY FROM STDIN / TO STDOUT / file-based
@@ -475,6 +552,8 @@ frenzypg/
 | `nextval()` sequence values | Different on primary vs mirror | Acceptable for testing; use WAL replication for exact consistency |
 | `now()` / `current_timestamp` | Slight time difference on mirror | Typically sub-second, acceptable |
 | Extended Query Protocol pipeline mode | Wire mode depends on psql-wire library support; Raw mode fully supports (transparent relay) | Use raw mode for pipeline-heavy workloads |
+| Binary-format parameters in Extended Query | Queries with binary Bind parameters cannot be mirrored | Use text-format parameters (default for most drivers) |
+| Mirror replay speed | Mirror throughput bounded by target DB write capacity, not proxy | Scale mirror instance or reduce primary write rate |
 
 ## Security
 

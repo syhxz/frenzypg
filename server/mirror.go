@@ -13,8 +13,9 @@ import (
 const (
 	// maxTxBufferBytes is the maximum total bytes of buffered queries per transaction
 	maxTxBufferBytes = 10 * 1024 * 1024 // 10 MB
-	// maxTotalTxBuffers is the maximum number of concurrent transaction buffers
-	maxTotalTxBuffers = 5000
+	// maxTotalTxBuffers limits concurrent transaction buffers to prevent OOM.
+	// At max capacity: 1000 * 10MB = 10GB theoretical peak (but most buffers are small).
+	maxTotalTxBuffers = 1000
 )
 
 // dispatchToMirrors decides whether and how to send a query to mirrors.

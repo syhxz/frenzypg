@@ -133,9 +133,11 @@ func (connection *Connection) Reconnect(ctx context.Context) error {
 		return fmt.Errorf("reconnect ping failed: %w", err)
 	}
 
-	// Swap: replace old pool with new one
+	// Swap: replace old pool with new one (protected by mutex)
+	connection.poolMu.Lock()
 	oldPool := connection.pool
 	connection.pool = newPool
+	connection.poolMu.Unlock()
 
 	// Close old pool in background (let in-flight queries finish)
 	if oldPool != nil {

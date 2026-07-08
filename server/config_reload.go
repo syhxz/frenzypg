@@ -108,7 +108,7 @@ func (cr *ConfigReloader) reload() {
 			MirrorDdlOnly:       raw.Filter.MirrorDdlOnly,
 			MirrorDmlOnly:       raw.Filter.MirrorDmlOnly,
 			SkipRollbackMirror:  raw.Filter.SkipRollbackMirror,
-			SkipFailedTxMirror:  raw.Filter.SkipFailedTxMirror,
+			SkipFailedTxMirror:  !raw.Filter.MirrorFailedTx,
 			SkipMirrorTxLocks:   raw.Filter.SkipMirrorTxLocks,
 		},
 	}
@@ -143,7 +143,7 @@ type reloadConfigRaw struct {
 		MirrorDdlOnly       bool `yaml:"mirror_ddl_only"`
 		MirrorDmlOnly       bool `yaml:"mirror_dml_only"`
 		SkipRollbackMirror  bool `yaml:"skip_rollback_mirror"`
-		SkipFailedTxMirror  bool `yaml:"skip_failed_tx_mirror"`
+		MirrorFailedTx      bool `yaml:"mirror_failed_tx"`
 		SkipMirrorTxLocks   bool `yaml:"skip_mirror_tx_locks"`
 	} `yaml:"filter"`
 }

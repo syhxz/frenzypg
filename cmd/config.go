@@ -55,7 +55,7 @@ type Config struct {
 		MirrorDdlOnly       bool `yaml:"mirror_ddl_only"`
 		MirrorDmlOnly       bool `yaml:"mirror_dml_only"`
 		SkipRollbackMirror  bool `yaml:"skip_rollback_mirror"`
-		SkipFailedTxMirror  bool `yaml:"skip_failed_tx_mirror"`
+		MirrorFailedTx      bool `yaml:"mirror_failed_tx"`  // opt-in: set true to mirror failed transactions (default: skip)
 		SkipMirrorTxLocks   bool `yaml:"skip_mirror_tx_locks"`
 	} `yaml:"filter"`
 
@@ -63,6 +63,24 @@ type Config struct {
 		PIDFile    string `yaml:"pid_file"`
 		HealthPort int    `yaml:"health_port"`
 	} `yaml:"service"`
+
+	Kafka struct {
+		Brokers         []string `yaml:"brokers"`
+		Topic           string   `yaml:"topic"`
+		Partitions      int      `yaml:"partitions"`
+		SASLMechanism   string   `yaml:"sasl_mechanism"`
+		SASLUsername    string   `yaml:"sasl_username"`
+		SASLPassword    string   `yaml:"sasl_password"`
+		SASLPasswordEnv string   `yaml:"sasl_password_env"`
+		TLSEnabled      bool     `yaml:"tls_enabled"`
+		TLSSkipVerify   bool     `yaml:"tls_skip_verify"`
+		TLSCAFile       string   `yaml:"tls_ca_file"`
+		TLSCertFile     string   `yaml:"tls_cert_file"`
+		TLSKeyFile      string   `yaml:"tls_key_file"`
+		LocalBufferSize int      `yaml:"local_buffer_size"`
+		Workers         int      `yaml:"workers"`
+		GroupID         string   `yaml:"group_id"`
+	} `yaml:"kafka"`
 }
 
 // loadConfig reads and parses the YAML configuration file.

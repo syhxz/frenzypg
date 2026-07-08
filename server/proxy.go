@@ -60,6 +60,7 @@ type ProxyServerV15 struct {
 
 	// Column cache: avoids repeated PREPARE round-trips for same query patterns
 	columnCache      sync.Map // map[string]wire.Columns
+	columnCacheSize  atomic.Int64
 }
 
 func NewProxyServerV15(logger *zap.Logger) *ProxyServerV15 {
@@ -223,8 +224,23 @@ func (server *ProxyServerV15) getCachedColumns(ctx context.Context, query string
 		return nil
 	}
 
+	// Evict cache if it grows too large.
+	// Use CompareAndSwap to ensure only one goroutine performs eviction,
+	// preventing counter drift under concurrency.
+	const maxColumnCacheEntries = 10000
+	if server.columnCacheSize.Load() >= maxColumnCacheEntries {
+		// Only one goroutine should evict — use CAS as a gate
+		if server.columnCacheSize.CompareAndSwap(server.columnCacheSize.Load(), 0) {
+			server.columnCache.Range(func(key, value any) bool {
+				server.columnCache.Delete(key)
+				return true
+			})
+		}
+	}
+
 	// Store in cache
 	server.columnCache.Store(cacheKey, columns)
+	server.columnCacheSize.Add(1)
 	return columns
 }
 
@@ -267,11 +283,42 @@ func normalizeQueryForCache(query string) string {
 				}
 			}
 			sb.WriteByte('?')
-			// Skip remaining digits and decimal point
-			for i < n && ((runes[i] >= '0' && runes[i] <= '9') || runes[i] == '.') {
+			// Skip remaining digits, decimal point, and scientific notation (e.g., 1.5e10)
+			for i < n && ((runes[i] >= '0' && runes[i] <= '9') || runes[i] == '.' || runes[i] == 'e' || runes[i] == 'E' || runes[i] == '+' || runes[i] == '-') {
+				// Only consume +/- if preceded by e/E (scientific notation)
+				if (runes[i] == '+' || runes[i] == '-') && i > 0 && runes[i-1] != 'e' && runes[i-1] != 'E' {
+					break
+				}
 				i++
 			}
 			continue
+		}
+
+		// Handle negative numeric literals: minus followed by digit (but not subtraction)
+		if ch == '-' && i+1 < n && runes[i+1] >= '0' && runes[i+1] <= '9' {
+			// Check if this is a unary minus (not subtraction):
+			// preceded by operator, comma, open paren, keyword boundary, or start of string
+			isUnary := false
+			if i == 0 {
+				isUnary = true
+			} else {
+				prev := runes[i-1]
+				isUnary = prev == '(' || prev == ',' || prev == '=' || prev == '<' ||
+					prev == '>' || prev == '+' || prev == '-' || prev == '*' ||
+					prev == '/' || prev == ' ' || prev == '\t' || prev == '\n'
+			}
+			if isUnary {
+				sb.WriteByte('?')
+				i++ // skip the '-'
+				// Skip the number
+				for i < n && ((runes[i] >= '0' && runes[i] <= '9') || runes[i] == '.' || runes[i] == 'e' || runes[i] == 'E' || runes[i] == '+' || runes[i] == '-') {
+					if (runes[i] == '+' || runes[i] == '-') && i > 0 && runes[i-1] != 'e' && runes[i-1] != 'E' {
+						break
+					}
+					i++
+				}
+				continue
+			}
 		}
 
 		sb.WriteRune(ch)
@@ -284,6 +331,7 @@ func normalizeQueryForCache(query string) string {
 // getQueryColumnsWithPrepare gets column information using a fast approach.
 // For SELECT/WITH/SHOW queries, wraps in a subquery with LIMIT 0 to get column descriptions.
 // For non-result queries, returns empty columns immediately.
+// NOTE: Skips queries with volatile functions to avoid side effects.
 func (server *ProxyServerV15) getQueryColumnsWithPrepare(ctx context.Context, query string) (wire.Columns, error) {
 	if server.primary == nil || server.primary.pool == nil {
 		return wire.Columns{}, fmt.Errorf("primary connection not available")
@@ -295,6 +343,19 @@ func (server *ProxyServerV15) getQueryColumnsWithPrepare(ctx context.Context, qu
 		!strings.HasPrefix(trimmedQuery, "WITH") &&
 		!strings.HasPrefix(trimmedQuery, "SHOW") &&
 		!strings.HasPrefix(trimmedQuery, "EXPLAIN") {
+		return wire.Columns{}, nil
+	}
+
+	// Skip queries that may have side effects (volatile functions)
+	upperQuery := strings.ToUpper(query)
+	if strings.Contains(upperQuery, "NEXTVAL") ||
+		strings.Contains(upperQuery, "SETVAL") ||
+		strings.Contains(upperQuery, "CURRVAL") ||
+		strings.Contains(upperQuery, "LASTVAL") ||
+		strings.Contains(upperQuery, "PG_NOTIFY") ||
+		strings.Contains(upperQuery, "DBLINK") ||
+		strings.Contains(upperQuery, "LO_") {
+		// These functions have side effects — skip column detection
 		return wire.Columns{}, nil
 	}
 
@@ -386,10 +447,15 @@ func (server *ProxyServerV15) splitCommands(query string) []string {
 
 		// Dollar-quoted string: $tag$...$tag$
 		if ch == '$' {
-			// Try to read the tag
+			// Try to read the tag (must start with letter or underscore per PostgreSQL spec)
 			tagEnd := i + 1
-			for tagEnd < n && (runes[tagEnd] == '_' || (runes[tagEnd] >= 'a' && runes[tagEnd] <= 'z') || (runes[tagEnd] >= 'A' && runes[tagEnd] <= 'Z') || (runes[tagEnd] >= '0' && runes[tagEnd] <= '9')) {
+			// First character of tag must be letter or underscore (NOT digit)
+			if tagEnd < n && (runes[tagEnd] == '_' || (runes[tagEnd] >= 'a' && runes[tagEnd] <= 'z') || (runes[tagEnd] >= 'A' && runes[tagEnd] <= 'Z')) {
 				tagEnd++
+				// Subsequent characters can include digits
+				for tagEnd < n && (runes[tagEnd] == '_' || (runes[tagEnd] >= 'a' && runes[tagEnd] <= 'z') || (runes[tagEnd] >= 'A' && runes[tagEnd] <= 'Z') || (runes[tagEnd] >= '0' && runes[tagEnd] <= '9')) {
+					tagEnd++
+				}
 			}
 			if tagEnd < n && runes[tagEnd] == '$' {
 				// Found opening dollar quote: $tag$

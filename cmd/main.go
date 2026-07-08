@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"crypto/x509"
 	"fmt"
 	"log"
@@ -161,9 +162,10 @@ func runWithCLI() {
 		Required: false,
 		Help:     "Skip mirroring ROLLBACK transactions",
 	})
-	skipFailedTxMirror := parser.Flag("", "skip-failed-tx-mirror", &argparse.Options{
+	skipFailedTxMirror := parser.String("", "skip-failed-tx-mirror", &argparse.Options{
 		Required: false,
-		Help:     "Skip mirroring failed transactions",
+		Help:     "Skip mirroring failed transactions. Set to 'false' to mirror failed tx",
+		Default:  "true",
 	})
 	skipMirrorTxLocks := parser.Flag("", "skip-mirror-tx-locks", &argparse.Options{
 		Required: false,
@@ -277,7 +279,7 @@ func runWithCLI() {
 		zap.Bool("mirror_ddl_only", *mirrorDdlOnly),
 		zap.Bool("mirror_dml_only", *mirrorDmlOnly),
 		zap.Bool("skip_rollback_mirror", *skipRollbackMirror),
-		zap.Bool("skip_failed_tx_mirror", *skipFailedTxMirror),
+		zap.Bool("skip_failed_tx_mirror", *skipFailedTxMirror != "false"),
 		zap.Bool("skip_mirror_tx_locks", *skipMirrorTxLocks))
 
 	// Create query filter config
@@ -287,7 +289,7 @@ func runWithCLI() {
 		MirrorDdlOnly:       *mirrorDdlOnly,
 		MirrorDmlOnly:       *mirrorDmlOnly,
 		SkipRollbackMirror:  *skipRollbackMirror,
-		SkipFailedTxMirror:  *skipFailedTxMirror,
+		SkipFailedTxMirror:  *skipFailedTxMirror != "false",
 		SkipMirrorTxLocks:   *skipMirrorTxLocks,
 	}
 
@@ -496,7 +498,6 @@ func getEnvInt(key string, defaultVal int) int {
 }
 
 // startHealthCheck starts an HTTP health check endpoint bound to localhost only
-// startHealthCheck starts an HTTP health check endpoint bound to localhost only
 func startHealthCheck(port int, logger *zap.Logger, srv *server.ProxyServerV15) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -512,24 +513,37 @@ func startHealthCheck(port int, logger *zap.Logger, srv *server.ProxyServerV15) 
 			}
 		}
 
-		if healthy {
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, `{"status":"ok","mode":"wire","version":"%s","uptime":"%s"}`, version, time.Since(startTime).String())
-		} else {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprintf(w, `{"status":"unhealthy","detail":"%s","version":"%s","uptime":"%s"}`, details, version, time.Since(startTime).String())
+		resp := map[string]string{
+			"version": version,
+			"uptime":  time.Since(startTime).String(),
+			"mode":    "wire",
 		}
+		if healthy {
+			resp["status"] = "ok"
+			w.WriteHeader(http.StatusOK)
+		} else {
+			resp["status"] = "unhealthy"
+			resp["detail"] = details
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		json.NewEncoder(w).Encode(resp)
 	})
 	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"version":"%s","build_time":"%s"}`, version, buildTime)
+		json.NewEncoder(w).Encode(map[string]string{
+			"version":    version,
+			"build_time": buildTime,
+		})
 	})
 
-	// Register pprof handlers for profiling (use DefaultServeMux which has pprof registered)
-	mux.Handle("/debug/pprof/", http.DefaultServeMux)
+	// Register pprof handlers only if explicitly enabled (leaks goroutine stacks/heap)
+	if os.Getenv("FRENZY_ENABLE_PPROF") == "true" {
+		mux.Handle("/debug/pprof/", http.DefaultServeMux)
+		logger.Info("pprof enabled on health endpoint (FRENZY_ENABLE_PPROF=true)")
+	}
 
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	logger.Info("Health check endpoint started (with pprof)", zap.String("address", addr))
+	logger.Info("Health check endpoint started", zap.String("address", addr))
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		logger.Error("Health check endpoint failed", zap.Error(err))
 	}
@@ -550,26 +564,41 @@ func startRawHealthCheck(port int, logger *zap.Logger, srv *server.RawProxyServe
 			}
 		}
 
-		if healthy {
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, `{"status":"ok","mode":"raw","version":"%s","uptime":"%s"}`, version, time.Since(startTime).String())
-		} else {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprintf(w, `{"status":"unhealthy","detail":"%s","version":"%s","uptime":"%s"}`, details, version, time.Since(startTime).String())
+		resp := map[string]string{
+			"version": version,
+			"uptime":  time.Since(startTime).String(),
+			"mode":    "raw",
 		}
+		if healthy {
+			resp["status"] = "ok"
+			w.WriteHeader(http.StatusOK)
+		} else {
+			resp["status"] = "unhealthy"
+			resp["detail"] = details
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		json.NewEncoder(w).Encode(resp)
 	})
 	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"version":"%s","build_time":"%s","mode":"raw"}`, version, buildTime)
+		json.NewEncoder(w).Encode(map[string]string{
+			"version":    version,
+			"build_time": buildTime,
+			"mode":       "raw",
+		})
 	})
 
 	// Prometheus metrics endpoint
 	mux.Handle("/metrics", promhttp.Handler())
 
-	mux.Handle("/debug/pprof/", http.DefaultServeMux)
+	// Register pprof handlers only if explicitly enabled (leaks goroutine stacks/heap)
+	if os.Getenv("FRENZY_ENABLE_PPROF") == "true" {
+		mux.Handle("/debug/pprof/", http.DefaultServeMux)
+		logger.Info("pprof enabled on health endpoint (FRENZY_ENABLE_PPROF=true)")
+	}
 
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	logger.Info("Health check endpoint started (raw mode, with pprof + metrics)", zap.String("address", addr))
+	logger.Info("Health check endpoint started (raw mode, with metrics)", zap.String("address", addr))
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		logger.Error("Health check endpoint failed", zap.Error(err))
 	}
@@ -641,13 +670,16 @@ func runWithConfig(configPath string) {
 	}
 
 	// Query filter config
+	// SkipFailedTxMirror defaults to true (safe default).
+	// User can opt-in to mirror failed tx via "mirror_failed_tx: true" in YAML.
+	skipFailedTx := !cfg.Filter.MirrorFailedTx
 	filterConfig := &server.QueryFilterConfig{
 		MirrorAllQueries:    cfg.Filter.MirrorAllQueries,
 		MirrorSelectQueries: cfg.Filter.MirrorSelectQueries,
 		MirrorDdlOnly:       cfg.Filter.MirrorDdlOnly,
 		MirrorDmlOnly:       cfg.Filter.MirrorDmlOnly,
 		SkipRollbackMirror:  cfg.Filter.SkipRollbackMirror,
-		SkipFailedTxMirror:  cfg.Filter.SkipFailedTxMirror,
+		SkipFailedTxMirror:  skipFailedTx,
 		SkipMirrorTxLocks:   cfg.Filter.SkipMirrorTxLocks,
 	}
 
@@ -686,6 +718,27 @@ func runWithConfig(configPath string) {
 		rawSrv.SetPerformanceConfig(perfConfig)
 		rawSrv.SetQueryFilterConfig(filterConfig)
 		rawSrv.SetMaxConnections(int(poolConfig.MaxConns) * 10)
+
+		// Configure Kafka queue if brokers are specified
+		if len(cfg.Kafka.Brokers) > 0 {
+			rawSrv.SetKafkaConfig(&server.KafkaQueueConfig{
+				Brokers:         cfg.Kafka.Brokers,
+				Topic:           cfg.Kafka.Topic,
+				Partitions:      cfg.Kafka.Partitions,
+				SASLMechanism:   cfg.Kafka.SASLMechanism,
+				SASLUsername:    cfg.Kafka.SASLUsername,
+				SASLPassword:    cfg.Kafka.SASLPassword,
+				SASLPasswordEnv: cfg.Kafka.SASLPasswordEnv,
+				TLSEnabled:      cfg.Kafka.TLSEnabled,
+				TLSSkipVerify:   cfg.Kafka.TLSSkipVerify,
+				TLSCAFile:       cfg.Kafka.TLSCAFile,
+				TLSCertFile:     cfg.Kafka.TLSCertFile,
+				TLSKeyFile:      cfg.Kafka.TLSKeyFile,
+				LocalBufferSize: cfg.Kafka.LocalBufferSize,
+				Workers:         cfg.Kafka.Workers,
+				GroupID:         cfg.Kafka.GroupID,
+			})
+		}
 
 		go func() {
 			sig := <-sigCh

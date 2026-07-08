@@ -111,7 +111,9 @@ func NewMetrics(namespace string) *Metrics {
 		}),
 	}
 
-	prometheus.MustRegister(
+	// Use Register instead of MustRegister to avoid panic on duplicate registration
+	// (e.g., in tests or if NewMetrics is called multiple times)
+	collectors := []prometheus.Collector{
 		m.QueriesTotal,
 		m.MirrorQueriesTotal,
 		m.MirrorFailures,
@@ -124,7 +126,10 @@ func NewMetrics(namespace string) *Metrics {
 		m.CircuitBreakerState,
 		m.QueryDuration,
 		m.MirrorLag,
-	)
+	}
+	for _, c := range collectors {
+		_ = prometheus.Register(c) // ignore already-registered errors
+	}
 
 	return m
 }
@@ -202,6 +207,7 @@ func NewConnectionLimiter(maxConnections int, logger *zap.Logger) *ConnectionLim
 }
 
 // Allow checks if a new connection is allowed. Returns true and increments if under limit.
+// Uses CAS loop to prevent TOCTOU race under concurrent connection storms.
 func (cl *ConnectionLimiter) Allow() bool {
 	max := cl.maxConnections.Load()
 	if max <= 0 {
@@ -209,15 +215,19 @@ func (cl *ConnectionLimiter) Allow() bool {
 		cl.activeConnections.Add(1)
 		return true
 	}
-	current := cl.activeConnections.Load()
-	if current >= max {
-		cl.logger.Warn("Connection limit reached",
-			zap.Int64("active", current),
-			zap.Int64("max", max))
-		return false
+	for {
+		current := cl.activeConnections.Load()
+		if current >= max {
+			cl.logger.Warn("Connection limit reached",
+				zap.Int64("active", current),
+				zap.Int64("max", max))
+			return false
+		}
+		if cl.activeConnections.CompareAndSwap(current, current+1) {
+			return true
+		}
+		// CAS failed — another goroutine incremented. Retry.
 	}
-	cl.activeConnections.Add(1)
-	return true
 }
 
 // Release decrements the active connection count.

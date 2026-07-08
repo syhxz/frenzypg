@@ -65,6 +65,7 @@ type Connection struct {
 	name            string
 	host            string
 	pool            *pgxpool.Pool  // Use connection pool instead of single connection
+	poolMu          sync.RWMutex   // Protects pool during reconnection
 	pgServerVersion string
 	connectionType  ConnectionType
 	poolConfig      *PoolConfig    // Connection pool configuration
