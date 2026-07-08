@@ -1013,28 +1013,159 @@ func (s *RawProxyServer) maybeMirror(ctx context.Context, sql string, inTransact
 }
 
 // splitStatements splits a multi-statement SQL string on semicolons,
-// respecting single-quoted strings (doesn't split inside quotes).
+// correctly handling single-quoted strings, double-quoted identifiers,
+// dollar-quoted strings ($$ and $tag$), and SQL comments.
 func splitStatements(sql string) []string {
 	var stmts []string
 	var current strings.Builder
-	inQuote := false
-	for _, ch := range sql {
-		if ch == '\'' && !inQuote {
-			inQuote = true
+	runes := []rune(sql)
+	n := len(runes)
+	i := 0
+
+	for i < n {
+		ch := runes[i]
+
+		// Single-line comment: skip to end of line
+		if ch == '-' && i+1 < n && runes[i+1] == '-' {
+			for i < n && runes[i] != '\n' {
+				current.WriteRune(runes[i])
+				i++
+			}
+			continue
+		}
+
+		// Multi-line comment: skip to */
+		if ch == '/' && i+1 < n && runes[i+1] == '*' {
+			current.WriteRune(runes[i])
+			current.WriteRune(runes[i+1])
+			i += 2
+			depth := 1
+			for i < n && depth > 0 {
+				if runes[i] == '/' && i+1 < n && runes[i+1] == '*' {
+					depth++
+					current.WriteRune(runes[i])
+					current.WriteRune(runes[i+1])
+					i += 2
+				} else if runes[i] == '*' && i+1 < n && runes[i+1] == '/' {
+					depth--
+					current.WriteRune(runes[i])
+					current.WriteRune(runes[i+1])
+					i += 2
+				} else {
+					current.WriteRune(runes[i])
+					i++
+				}
+			}
+			continue
+		}
+
+		// Dollar-quoted string: $tag$...$tag$
+		if ch == '$' {
+			tagEnd := i + 1
+			// First character of tag must be letter or underscore (NOT digit)
+			if tagEnd < n && (runes[tagEnd] == '_' || (runes[tagEnd] >= 'a' && runes[tagEnd] <= 'z') || (runes[tagEnd] >= 'A' && runes[tagEnd] <= 'Z')) {
+				tagEnd++
+				for tagEnd < n && (runes[tagEnd] == '_' || (runes[tagEnd] >= 'a' && runes[tagEnd] <= 'z') || (runes[tagEnd] >= 'A' && runes[tagEnd] <= 'Z') || (runes[tagEnd] >= '0' && runes[tagEnd] <= '9')) {
+					tagEnd++
+				}
+			}
+			if tagEnd < n && runes[tagEnd] == '$' {
+				// Found opening dollar quote: $tag$ or $$
+				tag := string(runes[i : tagEnd+1])
+				for _, r := range tag {
+					current.WriteRune(r)
+				}
+				i = tagEnd + 1
+				// Find closing tag
+				for i < n {
+					if runes[i] == '$' {
+						remaining := string(runes[i:])
+						if strings.HasPrefix(remaining, tag) {
+							for _, r := range tag {
+								current.WriteRune(r)
+							}
+							i += len([]rune(tag))
+							break
+						}
+					}
+					current.WriteRune(runes[i])
+					i++
+				}
+				continue
+			}
+			// Not a dollar quote, just a $ character
 			current.WriteRune(ch)
-		} else if ch == '\'' && inQuote {
-			inQuote = false
+			i++
+			continue
+		}
+
+		// Single-quoted string with '' escape handling
+		if ch == '\'' {
 			current.WriteRune(ch)
-		} else if ch == ';' && !inQuote {
+			i++
+			for i < n {
+				if runes[i] == '\'' {
+					current.WriteRune(runes[i])
+					i++
+					// Check for escaped quote ''
+					if i < n && runes[i] == '\'' {
+						current.WriteRune(runes[i])
+						i++
+						continue
+					}
+					break
+				}
+				if runes[i] == '\\' && i+1 < n {
+					current.WriteRune(runes[i])
+					i++
+					current.WriteRune(runes[i])
+					i++
+					continue
+				}
+				current.WriteRune(runes[i])
+				i++
+			}
+			continue
+		}
+
+		// Double-quoted identifier
+		if ch == '"' {
+			current.WriteRune(ch)
+			i++
+			for i < n {
+				if runes[i] == '"' {
+					current.WriteRune(runes[i])
+					i++
+					// Check for escaped quote ""
+					if i < n && runes[i] == '"' {
+						current.WriteRune(runes[i])
+						i++
+						continue
+					}
+					break
+				}
+				current.WriteRune(runes[i])
+				i++
+			}
+			continue
+		}
+
+		// Semicolon — statement separator
+		if ch == ';' {
 			stmt := strings.TrimSpace(current.String())
 			if stmt != "" {
 				stmts = append(stmts, stmt)
 			}
 			current.Reset()
-		} else {
-			current.WriteRune(ch)
+			i++
+			continue
 		}
+
+		// Regular character
+		current.WriteRune(ch)
+		i++
 	}
+
 	// Last statement (no trailing semicolon)
 	if stmt := strings.TrimSpace(current.String()); stmt != "" {
 		stmts = append(stmts, stmt)
@@ -1636,29 +1767,159 @@ func resolveBindParameters(sql string, payload []byte) (string, bool) {
 		pos += int(paramLen)
 	}
 
-	// Substitute parameters into SQL: replace $N with safely quoted value
+	// Substitute parameters into SQL: replace $N with safely quoted value,
+	// but only when $N appears outside of quoted contexts (single-quoted strings,
+	// double-quoted identifiers, and dollar-quoted strings).
 	// Use PostgreSQL dollar-quoting to prevent SQL injection. Dollar-quoting
 	// ($$value$$) treats content literally without any escape interpretation,
 	// immune to backslash attacks and standard_conforming_strings settings.
 	// For numeric values, we pass them unquoted (safe since they contain only digits/dots/signs).
-	resolved := sql
-	for i := numParams; i >= 1; i-- {
-		placeholder := fmt.Sprintf("$%d", i)
-		var replacement string
-		if params[i-1] == "NULL" {
-			replacement = "NULL"
-		} else if isNumericLiteral(params[i-1]) {
-			// Pure numeric value — safe to inline without quoting
-			replacement = params[i-1]
+	replacements := make([]string, numParams)
+	for i := 0; i < numParams; i++ {
+		if params[i] == "NULL" {
+			replacements[i] = "NULL"
+		} else if isNumericLiteral(params[i]) {
+			replacements[i] = params[i]
 		} else {
-			// Find a dollar-quote tag that doesn't appear in the value
-			tag := findSafeDollarTag(params[i-1])
-			replacement = tag + params[i-1] + tag
+			tag := findSafeDollarTag(params[i])
+			replacements[i] = tag + params[i] + tag
 		}
-		resolved = strings.ReplaceAll(resolved, placeholder, replacement)
 	}
 
+	resolved := replaceParamsOutsideQuotes(sql, replacements)
+
 	return resolved, true
+}
+
+// replaceParamsOutsideQuotes replaces $N placeholders in sql with the corresponding
+// replacement values, but only when $N appears outside single-quoted strings,
+// double-quoted identifiers, and dollar-quoted strings.
+func replaceParamsOutsideQuotes(sql string, replacements []string) string {
+	runes := []rune(sql)
+	n := len(runes)
+	var out strings.Builder
+	out.Grow(len(sql))
+	i := 0
+
+	for i < n {
+		ch := runes[i]
+
+		// Single-quoted string — copy verbatim
+		if ch == '\'' {
+			out.WriteRune(ch)
+			i++
+			for i < n {
+				if runes[i] == '\'' {
+					out.WriteRune(runes[i])
+					i++
+					if i < n && runes[i] == '\'' {
+						out.WriteRune(runes[i])
+						i++
+						continue
+					}
+					break
+				}
+				if runes[i] == '\\' && i+1 < n {
+					out.WriteRune(runes[i])
+					i++
+					out.WriteRune(runes[i])
+					i++
+					continue
+				}
+				out.WriteRune(runes[i])
+				i++
+			}
+			continue
+		}
+
+		// Double-quoted identifier — copy verbatim
+		if ch == '"' {
+			out.WriteRune(ch)
+			i++
+			for i < n {
+				if runes[i] == '"' {
+					out.WriteRune(runes[i])
+					i++
+					if i < n && runes[i] == '"' {
+						out.WriteRune(runes[i])
+						i++
+						continue
+					}
+					break
+				}
+				out.WriteRune(runes[i])
+				i++
+			}
+			continue
+		}
+
+		// Dollar-quoted string — copy verbatim
+		if ch == '$' {
+			tagEnd := i + 1
+			if tagEnd < n && (runes[tagEnd] == '_' || (runes[tagEnd] >= 'a' && runes[tagEnd] <= 'z') || (runes[tagEnd] >= 'A' && runes[tagEnd] <= 'Z')) {
+				tagEnd++
+				for tagEnd < n && (runes[tagEnd] == '_' || (runes[tagEnd] >= 'a' && runes[tagEnd] <= 'z') || (runes[tagEnd] >= 'A' && runes[tagEnd] <= 'Z') || (runes[tagEnd] >= '0' && runes[tagEnd] <= '9')) {
+					tagEnd++
+				}
+			}
+			if tagEnd < n && runes[tagEnd] == '$' {
+				// Dollar-quote opening
+				tag := string(runes[i : tagEnd+1])
+				tagRunes := []rune(tag)
+				for _, r := range tagRunes {
+					out.WriteRune(r)
+				}
+				i = tagEnd + 1
+				// Copy until closing tag
+				for i < n {
+					if runes[i] == '$' {
+						remaining := string(runes[i:])
+						if strings.HasPrefix(remaining, tag) {
+							for _, r := range tagRunes {
+								out.WriteRune(r)
+							}
+							i += len(tagRunes)
+							break
+						}
+					}
+					out.WriteRune(runes[i])
+					i++
+				}
+				continue
+			}
+
+			// Check if this is a placeholder $N (digit after $)
+			if tagEnd <= n && i+1 < n && runes[i+1] >= '1' && runes[i+1] <= '9' {
+				// Read the full number
+				numStart := i + 1
+				numEnd := numStart
+				for numEnd < n && runes[numEnd] >= '0' && runes[numEnd] <= '9' {
+					numEnd++
+				}
+				numStr := string(runes[numStart:numEnd])
+				paramIdx := 0
+				for _, d := range numStr {
+					paramIdx = paramIdx*10 + int(d-'0')
+				}
+				if paramIdx >= 1 && paramIdx <= len(replacements) {
+					out.WriteString(replacements[paramIdx-1])
+					i = numEnd
+					continue
+				}
+			}
+
+			// Plain $ character (not a quote, not a valid placeholder)
+			out.WriteRune(ch)
+			i++
+			continue
+		}
+
+		// Regular character
+		out.WriteRune(ch)
+		i++
+	}
+
+	return out.String()
 }
 
 // isNumericLiteral checks if a string is a safe numeric literal (integer, decimal, or scientific notation).
